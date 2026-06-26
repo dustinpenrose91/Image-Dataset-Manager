@@ -1269,7 +1269,7 @@ def bulk_import_paired_files(
         asset_id = row["asset_id"]
 
         try:
-            content = open(txt_abs, encoding="utf-8").read().strip()
+            content = open(txt_abs, encoding="utf-8", errors="replace").read().strip()
         except OSError as e:
             summary.errors.append(f"Cannot read {txt_abs!r}: {e}")
             continue
