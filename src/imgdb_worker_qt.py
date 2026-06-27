@@ -110,6 +110,20 @@ class QtDBBridge:
         # garbage-collected before their signals fire.
         self._inflight: set = set()
 
+    def root_abs_path(self, label: str) -> Optional[str]:
+        """
+        Return the absolute path for a root label, or None if the federation
+        is not yet open or the label is not attached. Reads the worker's
+        federation snapshot from the GUI thread — safe under CPython's GIL
+        for a single dict lookup, and encapsulated here so callers don't
+        need to pierce _worker._fed directly.
+        """
+        fed = self._worker._fed
+        if fed is None:
+            return None
+        shard = fed.shards.get(label)
+        return shard.abs_path if shard is not None else None
+
     def submit(
         self,
         fn: Callable[..., Any],

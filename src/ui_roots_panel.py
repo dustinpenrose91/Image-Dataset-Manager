@@ -13,9 +13,11 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QSizePolicy, QVBoxLayout, QWidget,
+    QDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
+
+import imgdb
 
 import federation
 import imgdb_worker
@@ -177,6 +179,10 @@ class RootEntry(QWidget):
     def is_checked(self) -> bool:
         return self._check_btn.isChecked()
 
+    @property
+    def abs_path(self) -> str:
+        return self._abs_path
+
     # -- private -----------------------------------------------------------
 
     def start_scan(self) -> threading.Event:
@@ -224,12 +230,10 @@ class RootsPanel(QWidget):
     def __init__(
         self,
         bridge: QtDBBridge,
-        config_path: str,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._bridge = bridge
-        self._config_path = config_path
         self._entries: dict[str, RootEntry] = {}
         self._checked_labels: set[str] = set()
 
@@ -269,11 +273,9 @@ class RootsPanel(QWidget):
 
         roots = federation.list_roots(fed)
         for label, abs_path, status in roots:
-            checked = label not in self._checked_labels or label in self._checked_labels
             # First load: all available roots checked by default.
             if label not in self._checked_labels and status == "ok":
                 self._checked_labels.add(label)
-                checked = True
             entry = RootEntry(
                 label=label,
                 abs_path=abs_path,
@@ -376,7 +378,6 @@ class RootsPanel(QWidget):
             self.roots_changed.emit()
 
         def on_error(exc: BaseException) -> None:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Relocate failed", str(exc))
 
         self._bridge.submit(
@@ -391,7 +392,7 @@ class RootsPanel(QWidget):
         entry = self._entries.get(label)
         if entry is None:
             return
-        dlg = DeleteRootDialog(label, entry._abs_path)
+        dlg = DeleteRootDialog(label, entry.abs_path)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -400,7 +401,6 @@ class RootsPanel(QWidget):
             self.roots_changed.emit()
 
         def on_error(exc: BaseException) -> None:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Delete failed", str(exc))
 
         self._bridge.submit(
@@ -411,7 +411,6 @@ class RootsPanel(QWidget):
         )
 
     def _on_detach_requested(self, label: str) -> None:
-        from PySide6.QtWidgets import QMessageBox
         btn = QMessageBox.question(
             self, "Detach root",
             f"Detach '{label}' from the federation?\n\n"
@@ -425,7 +424,6 @@ class RootsPanel(QWidget):
             self.roots_changed.emit()
 
         def on_error(exc: BaseException) -> None:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Detach failed", str(exc))
 
         self._bridge.submit(
@@ -447,7 +445,6 @@ class RootsPanel(QWidget):
             self.roots_changed.emit()
 
         def on_error(exc: BaseException) -> None:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Attach failed", str(exc))
 
         self._bridge.submit(
@@ -457,8 +454,3 @@ class RootsPanel(QWidget):
             on_result=on_result,
             on_error=on_error,
         )
-
-
-# Late import to avoid circular import issues at module level.
-from PySide6.QtWidgets import QDialog
-import imgdb

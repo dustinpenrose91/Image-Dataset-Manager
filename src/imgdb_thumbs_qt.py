@@ -99,6 +99,9 @@ class PixmapLRU:
         while len(self._items) > self._capacity:
             self._items.popitem(last=False)
 
+    def invalidate(self, path: str) -> None:
+        self._items.pop(path, None)
+
     def clear(self) -> None:
         self._items.clear()
 
@@ -202,6 +205,10 @@ class QtThumbnailBridge:
             on_ready=relay.emit_ready,
             on_error=relay.emit_failed,
         )
+
+    def invalidate_thumb(self, dest_abs_path: str) -> None:
+        """Remove one entry from the pixmap LRU so the next request regenerates it."""
+        self._cache.invalidate(dest_abs_path)
 
     def bump_priority(self, dest_abs_path: str, new_priority: int) -> bool:
         """Elevate a queued job to a higher priority. See ThumbnailWorker.bump_priority."""

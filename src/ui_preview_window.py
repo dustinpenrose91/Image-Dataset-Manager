@@ -29,6 +29,7 @@ import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QMessageBox,
@@ -128,6 +129,11 @@ class _Canvas(QWidget):
 
     def set_brush_px(self, px: int) -> None:
         self._brush_px = max(2, px)
+        self.update()
+
+    def clear_crop(self) -> None:
+        self._crop_rect = None
+        self._crop_start = None
         self.update()
 
     def clear_mask(self) -> None:
@@ -426,8 +432,12 @@ class _MaskToolbar(QWidget):
 
 
 class _CropToolbar(QWidget):
-    apply_clicked  = Signal()
-    cancel_clicked = Signal()
+    apply_clicked        = Signal()
+    cancel_clicked       = Signal()
+    flip_h_clicked       = Signal()
+    flip_v_clicked       = Signal()
+    rotate_left_clicked  = Signal()
+    rotate_right_clicked = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -437,6 +447,22 @@ class _CropToolbar(QWidget):
         row.addWidget(QLabel("Drag to select crop region."))
         self._dims = QLabel()
         row.addWidget(self._dims)
+
+        sep = QLabel("  |  ")
+        sep.setStyleSheet("color: gray;")
+        row.addWidget(sep)
+
+        for label, tooltip, sig in (
+            ("↔ Flip H",  "Flip horizontally",         self.flip_h_clicked),
+            ("↕ Flip V",  "Flip vertically",            self.flip_v_clicked),
+            ("↺ 90°",     "Rotate 90° counter-clockwise", self.rotate_left_clicked),
+            ("↻ 90°",     "Rotate 90° clockwise",      self.rotate_right_clicked),
+        ):
+            btn = QPushButton(label)
+            btn.setToolTip(tooltip)
+            btn.clicked.connect(sig)
+            row.addWidget(btn)
+
         row.addStretch()
         apply = QPushButton("Apply crop")
         apply.setStyleSheet("font-weight:bold;")
@@ -464,6 +490,7 @@ class PreviewWindow(QWidget):
     """
 
     visibility_changed = Signal(bool)
+    image_modified     = Signal(str)    # abs_path — emitted after any destructive save
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent, Qt.WindowType.Window)
@@ -477,7 +504,7 @@ class PreviewWindow(QWidget):
         # Mode buttons
         self._view_btn = QPushButton("View")
         self._mask_btn = QPushButton("Mask")
-        self._crop_btn = QPushButton("Crop")
+        self._crop_btn = QPushButton("Crop && Transform")
         for b in (self._view_btn, self._mask_btn, self._crop_btn):
             b.setCheckable(True)
         self._view_btn.setChecked(True)
@@ -521,11 +548,26 @@ class PreviewWindow(QWidget):
 
         self._crop_tb.apply_clicked.connect(self._save_crop)
         self._crop_tb.cancel_clicked.connect(lambda: (
-            setattr(self._canvas, '_crop_rect', None),
-            self._canvas.update(),
+            self._canvas.clear_crop(),
             self._crop_tb.set_dims(0, 0),
         ))
         self._canvas.crop_rect_changed.connect(self._crop_tb.set_dims)
+        self._crop_tb.flip_h_clicked.connect(
+            lambda: self._apply_transform(lambda img: img.mirrored(True, False))
+        )
+        self._crop_tb.flip_v_clicked.connect(
+            lambda: self._apply_transform(lambda img: img.mirrored(False, True))
+        )
+        self._crop_tb.rotate_left_clicked.connect(
+            lambda: self._apply_transform(
+                lambda img: img.transformed(QTransform().rotate(-90))
+            )
+        )
+        self._crop_tb.rotate_right_clicked.connect(
+            lambda: self._apply_transform(
+                lambda img: img.transformed(QTransform().rotate(90))
+            )
+        )
 
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.hide)
         QShortcut(QKeySequence("V"), self, activated=lambda: self._set_mode(_Mode.VIEW))
@@ -619,7 +661,25 @@ class PreviewWindow(QWidget):
             return
         self._canvas.set_mask_from_image(img)
 
-    # -- crop ---------------------------------------------------------------
+    # -- crop & transform ---------------------------------------------------
+
+    def _apply_transform(self, transform_fn) -> None:
+        src = self._canvas.source_image()
+        if src is None or not self._abs_path:
+            return
+        reply = QMessageBox.question(
+            self, "Apply transform",
+            f"Overwrite the original file with the transformed image?\n\n{self._abs_path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        result = transform_fn(src)
+        if not result.save(self._abs_path):
+            QMessageBox.critical(self, "Transform", f"Failed to write:\n{self._abs_path}")
+            return
+        self.image_modified.emit(self._abs_path)
+        self.set_image(self._abs_path, self._rel_path)
 
     def _save_crop(self) -> None:
         rect = self._canvas.crop_rect()
@@ -640,6 +700,7 @@ class PreviewWindow(QWidget):
         if not cropped.save(self._abs_path):
             QMessageBox.critical(self, "Crop", f"Failed to write:\n{self._abs_path}")
             return
+        self.image_modified.emit(self._abs_path)
         self.set_image(self._abs_path, self._rel_path)
 
     # -- visibility ---------------------------------------------------------

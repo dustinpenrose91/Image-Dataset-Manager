@@ -303,7 +303,7 @@ class AssetTableModel(QAbstractTableModel):
             self._pages_inflight.discard(page)
 
         def fetch_fn(fed: federation.Federation) -> list[federation.AssetRow]:
-            rows = list(federation.list_filtered_assets(
+            return list(federation.list_filtered_assets(
                 fed,
                 checked_labels=cl,
                 where_clause=wh,
@@ -312,12 +312,9 @@ class AssetTableModel(QAbstractTableModel):
                 show_missing=sm,
                 dataset_name=dn,
                 tag_filter=tf,
+                limit=PAGE_SIZE,
+                offset=offset,
             ))
-            # list_filtered_assets is a generator over the whole result;
-            # we slice the page manually here since the API doesn't support offset.
-            # For million-row sets a cursor-based approach would be needed, but for
-            # the current design this streams and slices in the worker thread.
-            return rows[offset: offset + PAGE_SIZE]
 
         self._bridge.submit(
             fetch_fn,
@@ -400,15 +397,11 @@ class AssetTableModel(QAbstractTableModel):
         Look for an already-generated LQ thumbnail on disk without a DB round-trip.
         Returns the LQ path, or None.  Strictly excludes HQ files (-hq.webp).
         """
-        worker = self._bridge._worker
-        fed = worker._fed
-        if fed is None:
-            return None
-        shard = fed.shards.get(asset.root)
-        if shard is None:
+        root_path = self._bridge.root_abs_path(asset.root)
+        if root_path is None:
             return None
         fan = asset.asset_id[:2]
-        thumb_dir = os.path.join(shard.abs_path, imgdb.THUMBS_DIRNAME, fan)
+        thumb_dir = os.path.join(root_path, imgdb.THUMBS_DIRNAME, fan)
         if not os.path.isdir(thumb_dir):
             return None
         prefix = asset.asset_id + "-"
@@ -419,6 +412,15 @@ class AssetTableModel(QAbstractTableModel):
                     and not name.endswith(hq_suffix)):
                 return os.path.join(thumb_dir, name)
         return None
+
+    def invalidate_asset_thumb(self, asset_id: str) -> None:
+        """
+        Clear thumbnail tracking state for one asset so the next paint
+        re-requests from scratch.  Call after evicting the pixmap from the
+        LRU so _get_or_request_thumb doesn't return None indefinitely.
+        """
+        self._thumb_dests.pop(asset_id, None)
+        self._thumb_requested.discard(asset_id)
 
     def _on_thumb_ready(self, asset_id: str, pixmap: QPixmap) -> None:
         for i, row in enumerate(self._rows):

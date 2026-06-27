@@ -23,12 +23,12 @@ import os
 import sys
 from typing import Optional
 
-from PySide6.QtCore import QSettings, QTimer, Qt
+from PySide6.QtCore import QItemSelectionModel, QSettings, QStringListModel, QTimer, Qt
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
+    QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QSplitter, QStackedWidget, QStatusBar, QTabWidget, QToolBar,
-    QVBoxLayout, QWidget, QCheckBox,
+    QVBoxLayout, QWidget,
 )
 
 import federation
@@ -41,10 +41,10 @@ from ui_asset_table import AssetTableModel, AssetTableView
 from ui_datasets_panel import DatasetsPanel
 from ui_detail_panel import DetailPanel
 from ui_dialogs import (
-    AddToDatasetDialog, AttachRootDialog,
-    BatchRemoveTagDialog, BatchReplaceTagDialog, BatchTagDialog,
+    AddToDatasetDialog, AmbiguousTagResolutionDialog,
+    BatchMoveDialog, BatchRemoveTagDialog, BatchReplaceTagDialog, BatchTagDialog,
     BulkImportDialog, ChangeTagTypeDialog,
-    ConfirmDeleteDialog, MergeDialog, ReplaceTagDialog,
+    ConfirmDeleteDialog, ImportFromCaptionDialog, MergeDialog, RenameDialog, ReplaceTagDialog,
 )
 from ui_preview_window import PreviewWindow
 from ui_query_tab import QueryTab
@@ -207,7 +207,7 @@ class MainWindow(QMainWindow):
         # Left sidebar: roots on top, datasets below
         self._left_splitter = QSplitter(Qt.Orientation.Vertical)
         self._left_splitter.setChildrenCollapsible(False)
-        self._roots_panel = RootsPanel(self._bridge, self._thumb_worker)
+        self._roots_panel = RootsPanel(self._bridge)
         self._datasets_panel = DatasetsPanel()
         self._left_splitter.addWidget(self._roots_panel)
         self._left_splitter.addWidget(self._datasets_panel)
@@ -263,6 +263,7 @@ class MainWindow(QMainWindow):
         self._table_view.doubleClicked.connect(self._on_table_double_click)
         # Keep toolbar button in sync when the window is closed via Escape/X.
         self._preview_win.visibility_changed.connect(self._preview_btn.setChecked)
+        self._preview_win.image_modified.connect(self._on_preview_image_modified)
 
         # Table count updates status bar
         self._table_model.rowsInserted.connect(self._update_status)
@@ -343,8 +344,7 @@ class MainWindow(QMainWindow):
         def reopen(fed: federation.Federation) -> federation.Federation:
             fed.close()
             new_fed = federation.open_federation(cfg)
-            # Replace the worker's internal fed reference.
-            self._worker._fed = new_fed
+            self._worker.set_federation(new_fed)
             return new_fed
 
         def on_ready(fed: federation.Federation) -> None:
@@ -420,7 +420,6 @@ class MainWindow(QMainWindow):
         """Select min(target_row, count-1) after the next model reset completes."""
         if target_row < 0:
             return
-        from PySide6.QtCore import QItemSelectionModel
         fired = [False]
         def _do_select(count: int) -> None:
             if fired[0]:
@@ -466,6 +465,52 @@ class MainWindow(QMainWindow):
         if not self._preview_win.isVisible():
             self._preview_win.show()
             self._preview_btn.setChecked(True)
+
+    def _on_preview_image_modified(self, abs_path: str) -> None:
+        """Delete stale thumbnail files + evict all caches, then reload both panes."""
+        def op(fed: federation.Federation) -> Optional[tuple[str, str, str]]:
+            for shard in fed.shards.values():
+                try:
+                    rel = os.path.relpath(abs_path, shard.abs_path).replace(os.sep, "/")
+                except ValueError:
+                    continue
+                if rel.startswith("../"):
+                    continue
+                row = shard.conn.execute(
+                    "SELECT asset_id, current_hash FROM assets WHERE rel_path = ?",
+                    (rel,),
+                ).fetchone()
+                if row:
+                    lq = imgdb_thumbs.thumb_path(
+                        shard.abs_path, row["asset_id"], row["current_hash"]
+                    )
+                    hq = imgdb_thumbs.thumb_path_hq(
+                        shard.abs_path, row["asset_id"], row["current_hash"]
+                    )
+                    for path in (lq, hq):
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            pass
+                    return row["asset_id"], lq, hq
+            return None
+
+        def on_done(result: Optional[tuple[str, str, str]]) -> None:
+            if result:
+                asset_id, lq, hq = result
+                # Evict from pixmap LRU so the next request regenerates.
+                self._thumb_bridge.invalidate_thumb(lq)
+                self._thumb_bridge.invalidate_thumb(hq)
+                # Clear model's dest/requested tracking so _get_or_request_thumb
+                # re-submits rather than returning None indefinitely.
+                self._table_model.invalidate_asset_thumb(asset_id)
+            # Reload detail panel (triggers HQ re-request at SELECTED priority).
+            self._detail_panel.load_selection(self._selected_assets, self._fed)
+            # Repaint visible table rows — now that tracking is cleared,
+            # _get_or_request_thumb will submit fresh LQ requests.
+            self._table_view.viewport().update()
+
+        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
     def _load_preview(self, asset: federation.AssetRow) -> None:
         if self._fed is None:
@@ -559,8 +604,6 @@ class MainWindow(QMainWindow):
             return tag_lookup, caption_texts, all_kinds, filtered_count, total_count
 
         def on_fetch(data: tuple) -> None:
-            from ui_dialogs import AmbiguousTagResolutionDialog, ImportFromCaptionDialog
-
             tag_lookup, caption_texts, all_kinds, filtered_count, total_count = data
             if not caption_texts:
                 QMessageBox.information(
@@ -663,7 +706,6 @@ class MainWindow(QMainWindow):
         self._bridge.submit(fetch, on_result=on_fetch, on_error=self._show_error)
 
     def _rename_asset(self, asset_id: str, current_rel_path: str) -> None:
-        from ui_dialogs import RenameDialog
         dlg = RenameDialog(current_rel_path, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -724,7 +766,6 @@ class MainWindow(QMainWindow):
         input dialog rather than opening the full MergeDialog (which expects
         both paths, not known here without a DB lookup).
         """
-        from PySide6.QtWidgets import QInputDialog
         other_id, ok = QInputDialog.getText(
             self, "Merge into…",
             "Enter the asset_id of the target (survivor) asset:",
@@ -801,8 +842,8 @@ class MainWindow(QMainWindow):
         type_name = dlg.type_name()
 
         def op(fed: federation.Federation) -> None:
-            for aid in asset_ids:
-                federation.add_tags(fed, aid, tags, type_name=type_name)
+            for tag in tags:
+                federation.add_tag_to_asset_ids(fed, asset_ids, tag, type_name)
 
         self._bridge.submit(op, on_error=self._show_error)
 
@@ -840,7 +881,6 @@ class MainWindow(QMainWindow):
             self._show_error(Exception(f"Shard '{root_label}' is unavailable."))
             return
 
-        from ui_dialogs import BatchMoveDialog
         dlg = BatchMoveDialog(len(assets), shard.abs_path, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -989,10 +1029,8 @@ class MainWindow(QMainWindow):
             self._tag_suggestions = tags
             self._tag_types = types
             self._detail_panel.set_tag_suggestions(tags)
-            from PySide6.QtCore import QStringListModel
-            from PySide6.QtWidgets import QCompleter
             c = QCompleter(self._tag_filter_edit)
-            c.setModel(QStringListModel([n for n, _ in tags], c))
+            c.setModel(QStringListModel([n for n, *_ in tags], c))
             c.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
             c.setFilterMode(Qt.MatchFlag.MatchContains)
             c.activated.connect(lambda _: self._apply_filter())
@@ -1176,7 +1214,6 @@ class MainWindow(QMainWindow):
         self._bridge.submit(fetch, on_result=on_names, on_error=self._show_error)
 
     def _rename_dataset(self, old_name: str) -> None:
-        from PySide6.QtWidgets import QInputDialog
         new_name, ok = QInputDialog.getText(
             self, "Rename dataset", "New name:", text=old_name
         )

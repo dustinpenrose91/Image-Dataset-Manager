@@ -495,5 +495,61 @@ class UserQueryTests(unittest.TestCase):
         self.assertTrue(all(r[0] == "alpha" for r in rows))
 
 
+class TestMatchTagsInText(unittest.TestCase):
+    """Unit tests for match_tags_in_text substring-suppression logic."""
+
+    def _lookup(self, names: list[str]) -> dict:
+        """Build a minimal tag_lookup from a list of tag names."""
+        return {n.lower(): (n, ["General"]) for n in names}
+
+    def test_longer_match_suppresses_substring(self):
+        # "dramatic" is only present as part of "dramatic lighting" → suppress it
+        lu = self._lookup(["dramatic", "dramatic lighting"])
+        result = [c for c, _ in federation.match_tags_in_text("dramatic lighting", lu)]
+        self.assertIn("dramatic lighting", result)
+        self.assertNotIn("dramatic", result)
+
+    def test_shorter_kept_when_independent_occurrence(self):
+        # "dramatic" appears independently at position 3
+        lu = self._lookup(["dramatic", "dramatic lighting"])
+        result = [c for c, _ in federation.match_tags_in_text(
+            "dramatic lighting and dramatic shadows", lu
+        )]
+        self.assertIn("dramatic lighting", result)
+        self.assertIn("dramatic", result)
+
+    def test_longer_prefix_suppresses_substring(self):
+        lu = self._lookup(["back", "lying on back"])
+        result = [c for c, _ in federation.match_tags_in_text("lying on back", lu)]
+        self.assertIn("lying on back", result)
+        self.assertNotIn("back", result)
+
+    def test_both_kept_when_substring_appears_independently(self):
+        lu = self._lookup(["back", "lying on back"])
+        result = [c for c, _ in federation.match_tags_in_text(
+            "back pain and lying on back", lu
+        )]
+        self.assertIn("back", result)
+        self.assertIn("lying on back", result)
+
+    def test_order_is_first_uncovered_appearance(self):
+        lu = self._lookup(["dramatic", "dramatic lighting"])
+        result = [c for c, _ in federation.match_tags_in_text(
+            "dramatic lighting and dramatic shadows", lu
+        )]
+        # "dramatic lighting" first (pos 0), "dramatic" second (pos 3)
+        self.assertEqual(result.index("dramatic lighting"), 0)
+        self.assertGreater(result.index("dramatic"), 0)
+
+    def test_no_tags_returns_empty(self):
+        lu = self._lookup(["cat"])
+        self.assertEqual(federation.match_tags_in_text("a dog", lu), [])
+
+    def test_exact_single_word_match(self):
+        lu = self._lookup(["cat"])
+        result = [c for c, _ in federation.match_tags_in_text("a cat sat", lu)]
+        self.assertEqual(result, ["cat"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

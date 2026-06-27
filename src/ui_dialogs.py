@@ -577,6 +577,7 @@ class AddTagCategoryDialog(QDialog):
         self,
         all_types: list[str],
         shown_types: set[str],
+        all_tags: list[tuple[str, str, int]],
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -584,18 +585,28 @@ class AddTagCategoryDialog(QDialog):
         self.setWindowTitle("Add Tag Category")
         self.setMinimumWidth(300)
 
-        available = [t for t in all_types if t not in shown_types and t != "General"]
+        # Tags grouped by type_name for dynamic filtering of the tag combo.
+        self._tags_by_type: dict[str, list[str]] = {}
+        for name, type_name, _cnt in all_tags:
+            self._tags_by_type.setdefault(type_name, []).append(name)
 
-        self._type_edit = QLineEdit()
-        self._type_edit.setPlaceholderText("e.g. Character, Style, Artist")
-        if available:
-            c = QCompleter(available, self)
-            c.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-            self._type_edit.setCompleter(c)
+        available_types = [t for t in all_types if t not in shown_types and t != "General"]
 
-        self._tag_edit = QLineEdit()
-        self._tag_edit.setPlaceholderText("tag name")
-        self._tag_edit.returnPressed.connect(self._validate_and_accept)
+        self._type_combo = QComboBox()
+        self._type_combo.setEditable(True)
+        self._type_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._type_combo.addItems(available_types)
+        self._type_combo.setCurrentIndex(-1)
+        self._type_combo.lineEdit().setPlaceholderText("e.g. Character, Style, Artist")
+
+        self._tag_combo = QComboBox()
+        self._tag_combo.setEditable(True)
+        self._tag_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._tag_combo.setCurrentIndex(-1)
+        self._tag_combo.lineEdit().setPlaceholderText("tag name")
+        self._tag_combo.lineEdit().returnPressed.connect(self._validate_and_accept)
+
+        self._type_combo.currentTextChanged.connect(self._on_type_changed)
 
         self._error_label = QLabel()
         self._error_label.setStyleSheet("color: red;")
@@ -609,13 +620,21 @@ class AddTagCategoryDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         form = QFormLayout()
-        form.addRow("Category:", self._type_edit)
-        form.addRow("First tag:", self._tag_edit)
+        form.addRow("Category:", self._type_combo)
+        form.addRow("Tag:", self._tag_combo)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self._error_label)
         layout.addWidget(buttons)
+
+    def _on_type_changed(self, type_name: str) -> None:
+        current_tag = self._tag_combo.currentText()
+        self._tag_combo.clear()
+        self._tag_combo.addItems(self._tags_by_type.get(type_name.strip(), []))
+        self._tag_combo.setCurrentIndex(-1)
+        if current_tag:
+            self._tag_combo.setCurrentText(current_tag)
 
     def _validate_and_accept(self) -> None:
         if not self.type_name():
@@ -623,17 +642,17 @@ class AddTagCategoryDialog(QDialog):
             self._error_label.show()
             return
         if not self.tag_name():
-            self._error_label.setText("Enter at least one tag name.")
+            self._error_label.setText("Enter a tag name.")
             self._error_label.show()
             return
         self._error_label.hide()
         self.accept()
 
     def type_name(self) -> str:
-        return self._type_edit.text().strip()
+        return self._type_combo.currentText().strip()
 
     def tag_name(self) -> str:
-        return self._tag_edit.text().strip()
+        return self._tag_combo.currentText().strip()
 
 
 class BatchTagDialog(QDialog):
@@ -682,10 +701,10 @@ class BatchTagDialog(QDialog):
         layout.addWidget(self._error_label)
         layout.addWidget(buttons)
 
-    def set_suggestions(self, tags: list[tuple[str, int]]) -> None:
-        counts = {name: count for name, count in tags}
+    def set_suggestions(self, tags: list[tuple[str, str, int]]) -> None:
+        counts = {name: count for name, _, count in tags}
         completer = _TagMultiCompleter()
-        completer.setModel(QStringListModel([name for name, _ in tags], completer))
+        completer.setModel(QStringListModel([name for name, *_ in tags], completer))
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)
         completer.popup().setItemDelegate(_TagCountDelegate(counts, completer.popup()))
@@ -716,11 +735,11 @@ class BatchTagDialog(QDialog):
         return self._types[idx] if 0 <= idx < len(self._types) else "General"
 
 
-def _tag_completer(tags: list[tuple[str, int]], parent: Optional[QWidget] = None) -> QCompleter:
+def _tag_completer(tags: list[tuple[str, str, int]], parent: Optional[QWidget] = None) -> QCompleter:
     """Single-value completer with contains-matching and usage-count delegate."""
-    counts = {name: count for name, count in tags}
+    counts = {name: count for name, _, count in tags}
     c = QCompleter(parent)
-    c.setModel(QStringListModel([name for name, _ in tags], c))
+    c.setModel(QStringListModel([name for name, *_ in tags], c))
     c.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
     c.setFilterMode(Qt.MatchFlag.MatchContains)
     c.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
@@ -734,7 +753,7 @@ class BatchRemoveTagDialog(QDialog):
     def __init__(
         self,
         n_assets: int,
-        tags: list[tuple[str, int]],
+        tags: list[tuple[str, str, int]],
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -783,7 +802,7 @@ class BatchReplaceTagDialog(QDialog):
     def __init__(
         self,
         n_assets: int,
-        tags: list[tuple[str, int]],
+        tags: list[tuple[str, str, int]],
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)

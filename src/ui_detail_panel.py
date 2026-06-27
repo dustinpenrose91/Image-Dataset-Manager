@@ -169,8 +169,8 @@ class _TagGroup(QWidget):
             chip.filter_requested.connect(self.filter_requested)
             self._chips.addWidget(chip)
 
-    def set_suggestions(self, tags: list[tuple[str, int]]) -> None:
-        self._input.set_suggestions(tags)
+    def set_suggestions(self, tags: list[tuple[str, str, int]]) -> None:
+        self._input.set_suggestions([t for t in tags if t[1] == self._type_name])
 
     def focus_input(self) -> None:
         self._input.focus()
@@ -191,6 +191,7 @@ class _TagsSection(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._all_types: list[str] = ["General"]
+        self._all_tags: list[tuple[str, str, int]] = []
         self._groups: dict[str, _TagGroup] = {}
 
         self._groups_layout = QVBoxLayout()
@@ -245,7 +246,8 @@ class _TagsSection(QWidget):
                 self._add_group(type_name, type_name == "General", rows=[], position=i)
             self._groups[type_name].load(by_type.get(type_name, []))
 
-    def set_suggestions(self, tags: list[tuple[str, int]]) -> None:
+    def set_suggestions(self, tags: list[tuple[str, str, int]]) -> None:
+        self._all_tags = tags
         for grp in self._groups.values():
             grp.set_suggestions(tags)
 
@@ -265,10 +267,11 @@ class _TagsSection(QWidget):
         else:
             self._groups_layout.addWidget(grp)
         self._groups[type_name] = grp
+        grp.set_suggestions(self._all_tags)
 
     def _on_add_category(self) -> None:
         shown = set(self._groups.keys())
-        dlg = AddTagCategoryDialog(self._all_types, shown, self)
+        dlg = AddTagCategoryDialog(self._all_types, shown, self._all_tags, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self.tag_added.emit(dlg.tag_name(), dlg.type_name())
@@ -451,7 +454,7 @@ class _SingleDetail(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(scroll)
 
-    def set_tag_suggestions(self, tags: list[tuple[str, int]]) -> None:
+    def set_tag_suggestions(self, tags: list[tuple[str, str, int]]) -> None:
         self._tags_section.set_suggestions(tags)
 
     def load_asset(
@@ -518,29 +521,10 @@ class _SingleDetail(QWidget):
             shard = fed.shards.get(root)
             if shard is None:
                 return [], {}, [], []
-            tag_rows = shard.conn.execute(
-                """SELECT t.tag_id, t.name, tt.name AS type_name
-                     FROM tags t
-                     JOIN tag_types tt ON tt.type_id = t.type_id
-                     JOIN asset_tags at ON at.tag_id = t.tag_id
-                    WHERE at.asset_id = ?
-                    ORDER BY tt.type_id ASC, t.name ASC""",
-                (aid,),
-            ).fetchall()
-            caps = {
-                r["kind"]: r["content"]
-                for r in shard.conn.execute(
-                    "SELECT kind, content FROM captions WHERE asset_id = ? ORDER BY kind",
-                    (aid,),
-                )
-            }
+            tag_rows = imgdb.get_tags_for_asset(shard.conn, aid)
+            caps = imgdb.get_captions_for_asset(shard.conn, aid)
             all_types = federation.list_all_tag_types_federation(fed)
-            datasets = [
-                r[0] for r in shard.conn.execute(
-                    "SELECT dataset_name FROM dataset_assets WHERE asset_id = ? ORDER BY dataset_name",
-                    (aid,),
-                )
-            ]
+            datasets = imgdb.get_dataset_membership(shard.conn, aid)
             return tag_rows, caps, all_types, datasets
 
         def on_result(data) -> None:
@@ -826,7 +810,7 @@ class DetailPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._stack)
 
-    def set_tag_suggestions(self, tags: list[tuple[str, int]]) -> None:
+    def set_tag_suggestions(self, tags: list[tuple[str, str, int]]) -> None:
         self._single.set_tag_suggestions(tags)
 
     def set_active_dataset(self, name: Optional[str]) -> None:
@@ -981,10 +965,10 @@ class _TagInput(QWidget):
         row.addWidget(self._edit)
         row.addWidget(add_btn)
 
-    def set_suggestions(self, tags: list[tuple[str, int]]) -> None:
+    def set_suggestions(self, tags: list[tuple[str, str, int]]) -> None:
         from PySide6.QtCore import QStringListModel
-        counts = {name: count for name, count in tags}
-        model = QStringListModel([name for name, _ in tags], self._completer)
+        counts = {name: count for name, _, count in tags}
+        model = QStringListModel([name for name, *_ in tags], self._completer)
         self._completer.setModel(model)
         self._completer.popup().setItemDelegate(_CountDelegate(counts, self._completer.popup()))
 

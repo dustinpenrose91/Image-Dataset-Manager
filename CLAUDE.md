@@ -22,7 +22,7 @@ cd src && python imgdb_ui.py
 ## Dependencies
 
 - Python 3.10+
-- `pip install blake3 Pillow PySide6`
+- `pip install blake3 Pillow PySide6 numpy`
 
 ## Architecture
 

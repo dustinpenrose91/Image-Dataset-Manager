@@ -205,6 +205,13 @@ class DBWorker:
         self._thread = None
         self._fed = None
 
+    def set_federation(self, new_fed: "federation.Federation") -> None:
+        """
+        Replace the active federation. Must only be called from within a
+        submitted job (i.e., from the worker thread), not from the GUI thread.
+        """
+        self._fed = new_fed
+
     # -- submission ---------------------------------------------------------
 
     def submit(

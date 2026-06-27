@@ -516,12 +516,8 @@ def delete_root(fed: Federation, label: str) -> None:
     thumbnails directory. The image files themselves are not touched.
     Irreversible.
     """
-    import shutil
-
     shard = shard_by_label(fed, label)
     abs_path = shard.abs_path
-
-    # Close the shard connection before deleting its files.
     try:
         shard.conn.close()
     except Exception:
@@ -964,6 +960,8 @@ def list_filtered_assets(
     show_missing: bool = False,
     dataset_name: Optional[str] = None,
     tag_filter: Optional[list[str]] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Iterator[AssetRow]:
     """
     Stream asset rows from the federation, restricted to the checked
@@ -978,8 +976,9 @@ def list_filtered_assets(
     the caller is expected to surface this and leave the previous filter
     in place.
 
-    Streams via fetchmany so the entire result set is never in memory at
-    once. Important for million-asset federations.
+    `limit` and `offset` map directly to SQL LIMIT/OFFSET — use them for
+    pagination so only the needed rows are transferred. Omit both to stream
+    the full result set via fetchmany (important for million-asset sets).
     """
     if fed.read_conn is None:
         return
@@ -1034,6 +1033,17 @@ def list_filtered_assets(
     # asset_id tiebreaker so paginated/streamed results are deterministic
     # across calls.
     sql_parts.append(f"ORDER BY {sort_by} {direction}, asset_id ASC")
+
+    if limit is not None:
+        sql_parts.append("LIMIT ?")
+        params.append(limit)
+        if offset:
+            sql_parts.append("OFFSET ?")
+            params.append(offset)
+    elif offset:
+        # SQLite requires LIMIT when OFFSET is used; -1 means no limit.
+        sql_parts.append("LIMIT -1 OFFSET ?")
+        params.append(offset)
 
     sql = "\n".join(sql_parts)
     cursor = fed.read_conn.execute(sql, params)
@@ -1389,23 +1399,25 @@ def delete_dataset(fed: Federation, name: str) -> list[str]:
     return affected
 
 
-def list_all_tags_with_counts(fed: Federation) -> list[tuple[str, int]]:
+def list_all_tags_with_counts(fed: Federation) -> list[tuple[str, str, int]]:
     """
-    Return (tag_name, usage_count) across all attached shards, sorted by
-    count descending. Suitable for precomputing autocomplete suggestions.
+    Return (tag_name, type_name, usage_count) across all attached shards,
+    sorted by count descending. Carrying type alongside count lets callers
+    filter suggestions by category without a second query.
     """
     if fed.read_conn is None:
         return []
     rows = fed.read_conn.execute(
         """
-        SELECT t.name, COUNT(at.asset_id) AS cnt
+        SELECT t.name, tt.name AS type_name, COUNT(at.asset_id) AS cnt
           FROM all_tags t
-          JOIN all_asset_tags at ON at.tag_id = t.tag_id
-         GROUP BY t.name
+          JOIN all_tag_types tt ON tt.type_id = t.type_id AND tt._root = t._root
+          JOIN all_asset_tags at ON at.tag_id = t.tag_id AND at._root = t._root
+         GROUP BY t.name, tt.name
          ORDER BY cnt DESC, t.name ASC
         """
     ).fetchall()
-    return [(row[0], row[1]) for row in rows]
+    return [(row[0], row[1], row[2]) for row in rows]
 
 
 def build_tag_lookup(
@@ -1444,28 +1456,52 @@ def match_tags_in_text(
     tag_lookup: dict[str, tuple[str, list[str]]],
 ) -> list[tuple[str, list[str]]]:
     """
-    Find all known tags that appear as whole-word substrings of text.
-    Returns [(canonical_name, [type_names])] in order of first appearance.
+    Find all known tags present as whole-word phrases in text.
+    Returns [(canonical_name, [type_names])] in first-appearance order.
 
-    Uses n-gram tokenization: O(words × max_tag_words) — one dict lookup per
-    candidate instead of one regex search per tag.  Max n-gram length is
-    capped at 6 to guard against pathological tag sets.
+    Shorter tags that are sub-phrases of longer matched tags are suppressed
+    unless they also occur independently at a position not covered by any
+    longer match.
+
+    Example: in "dramatic lighting", "dramatic" is suppressed because its
+    only occurrence is covered by "dramatic lighting".  In "dramatic lighting
+    and dramatic shadows", "dramatic" is kept because its second occurrence
+    at position 3 is not covered by anything.
     """
     tokens = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_]*", text.lower())
     if not tokens or not tag_lookup:
         return []
     max_n = min(max(len(k.split()) for k in tag_lookup), 6)
-    seen: set[str] = set()
-    results: list[tuple[str, list[str]]] = []
     n_tokens = len(tokens)
+
+    # Collect every (start, end) span where each key matches.
+    all_spans: dict[str, list[tuple[int, int]]] = {}
     for i in range(n_tokens):
         for n in range(1, min(max_n, n_tokens - i) + 1):
             ngram = " ".join(tokens[i : i + n])
-            if ngram in tag_lookup and ngram not in seen:
-                seen.add(ngram)
-                canon, types = tag_lookup[ngram]
-                results.append((canon, list(types)))
-    return results
+            if ngram in tag_lookup:
+                all_spans.setdefault(ngram, []).append((i, i + n))
+
+    if not all_spans:
+        return []
+
+    # Flat list of all match spans used for coverage checks.
+    flat: list[tuple[int, int]] = [s for spans in all_spans.values() for s in spans]
+
+    # A tag is kept only if at least one of its spans is not fully covered
+    # by some strictly longer match span.  Record the position of the first
+    # such uncovered span for ordering.
+    first_pos: dict[str, int] = {}
+    for key, spans in all_spans.items():
+        for start, end in spans:
+            length = end - start
+            if not any(a <= start and b >= end and (b - a) > length for a, b in flat):
+                first_pos.setdefault(key, start)
+
+    return [
+        (tag_lookup[k][0], list(tag_lookup[k][1]))
+        for k in sorted(first_pos, key=first_pos.__getitem__)
+    ]
 
 
 def list_all_caption_kinds(
@@ -1522,6 +1558,7 @@ def import_caption_tags_for_asset(
     tag_lookup: dict[str, tuple[str, list[str]]],
     resolution: dict[str, str],
     only_names: Optional[set[str]] = None,
+    _shard: Optional["Shard"] = None,
 ) -> int:
     """
     Match tags in an asset's caption(s) and add any not already present.
@@ -1530,10 +1567,11 @@ def import_caption_tags_for_asset(
                 from resolution default to "General".
     only_names: if provided, restrict to this lowercase name set (single-image
                 checklist).
+    _shard: optional pre-resolved Shard; if omitted, resolved via asset_index.
     Returns the count of tag assignments added.  add_tags uses INSERT OR IGNORE
     so existing assignments are silently skipped.
     """
-    shard = shard_for_asset(fed, asset_id)
+    shard = _shard if _shard is not None else shard_for_asset(fed, asset_id)
     text = _caption_text_for_asset(shard, asset_id, caption_kind)
     if not text.strip():
         return 0
@@ -1571,7 +1609,9 @@ def prescan_ambiguous_matches(
         dataset_name=dataset_name,
         tag_filter=tag_filter,
     ):
-        shard = shard_for_asset(fed, asset.asset_id)
+        shard = fed.shards.get(asset.root)
+        if shard is None:
+            continue
         text = _caption_text_for_asset(shard, asset.asset_id, caption_kind)
         for canon, types in match_tags_in_text(text, tag_lookup):
             if len(types) > 1:
@@ -1602,8 +1642,11 @@ def bulk_import_caption_tags(
         dataset_name=dataset_name,
         tag_filter=tag_filter,
     ):
+        shard = fed.shards.get(asset.root)
+        if shard is None:
+            continue
         total += import_caption_tags_for_asset(
-            fed, asset.asset_id, caption_kind, tag_lookup, resolution
+            fed, asset.asset_id, caption_kind, tag_lookup, resolution, _shard=shard
         )
     return total
 

@@ -855,6 +855,46 @@ def remove_tags_by_name(
             )
 
 
+def get_tags_for_asset(
+    conn: sqlite3.Connection, asset_id: str
+) -> list[sqlite3.Row]:
+    """Return all tags for an asset with tag_id, name, and type_name columns."""
+    return conn.execute(
+        """SELECT t.tag_id, t.name, tt.name AS type_name
+             FROM tags t
+             JOIN tag_types tt ON tt.type_id = t.type_id
+             JOIN asset_tags at ON at.tag_id = t.tag_id
+            WHERE at.asset_id = ?
+            ORDER BY tt.type_id ASC, t.name ASC""",
+        (asset_id,),
+    ).fetchall()
+
+
+def get_captions_for_asset(
+    conn: sqlite3.Connection, asset_id: str
+) -> dict[str, str]:
+    """Return {kind: content} for all captions belonging to an asset."""
+    return {
+        r["kind"]: r["content"]
+        for r in conn.execute(
+            "SELECT kind, content FROM captions WHERE asset_id = ? ORDER BY kind",
+            (asset_id,),
+        )
+    }
+
+
+def get_dataset_membership(
+    conn: sqlite3.Connection, asset_id: str
+) -> list[str]:
+    """Return dataset names this asset belongs to, sorted."""
+    return [
+        r[0] for r in conn.execute(
+            "SELECT dataset_name FROM dataset_assets WHERE asset_id = ? ORDER BY dataset_name",
+            (asset_id,),
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Captions
 # ---------------------------------------------------------------------------

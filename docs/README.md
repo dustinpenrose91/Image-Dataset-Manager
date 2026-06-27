@@ -30,6 +30,11 @@ These rules are load-bearing.  Every component is built to enforce them.
    Architecture below.
 8. **Cross-shard writes are forbidden.**  Every write routes to exactly one
    shard.  Merging assets across roots is not allowed.
+9. **Data structures carry their full context.**  Schemas and in-memory
+   structures include enough fields to support future consumers without
+   requiring a second query.  Narrow return types (e.g. `(name, count)`)
+   are upgraded when a new caller needs more (e.g. `(name, type, count)`)
+   rather than adding a parallel lookup.
 
 ## Architecture
 
@@ -91,7 +96,7 @@ The main window is split into three panes:
 
 - **Left** — root/shard list.  Per-root checkboxes control which shards are
   included in filter results and bulk operations.
-- **Centre** — virtualized, sortable asset table with filter bar.  Filtering
+- **Center** — virtualized, sortable asset table with filter bar.  Filtering
   supports a freeform SQL `WHERE` clause, an active dataset selector,
   AND-combined tag filters, and a show/hide missing-file toggle.
 - **Right** — tabbed panel with Image Properties and Tag Management.
@@ -130,6 +135,7 @@ name, category, and usage count.  Bulk operations:
 
 ### Import tags from caption
 
+**Edit: Claude wrote this doc. I'm leaving this bit uncorrected because it's really fucking funny**
 "Import from caption…" opens a dialog that matches known tags against an
 asset's caption text using word-boundary-aware n-gram tokenization — substring
 false-positives like "red" inside "already" are excluded automatically.
