@@ -24,6 +24,7 @@ import sys
 from typing import Optional
 
 from PySide6.QtCore import QItemSelectionModel, QSettings, QStringListModel, QTimer, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
@@ -728,7 +729,7 @@ class MainWindow(QMainWindow):
                 new_abs = os.path.join(shard.abs_path, new_rel_path.replace("/", os.sep))
                 if os.path.exists(new_abs):
                     btn = QMessageBox.question(
-                        self, "File already exists",
+                        self, "⚠ File already exists",
                         f"A file already exists at:\n{new_rel_path}\n\nOverwrite it?",
                     )
                     if btn != QMessageBox.StandardButton.Yes:
@@ -1074,7 +1075,7 @@ class MainWindow(QMainWindow):
     def _tm_delete_tag(self, tag_name: str, type_name: str) -> None:
         ans = QMessageBox.question(
             self,
-            "Delete Tag",
+            "⚠ Delete Tag",
             f"Delete tag \"{tag_name}\" (category: {type_name}) from all assets?\n\nThis cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
         )
@@ -1122,6 +1123,13 @@ class MainWindow(QMainWindow):
         self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
     def _tm_add_to_filtered(self, tag_name: str, type_name: str) -> None:
+        btn = QMessageBox.question(
+            self,
+            "⚠ Add tag to filtered assets",
+            f"Add tag \"{tag_name}\" ({type_name}) to all currently filtered assets?",
+        )
+        if btn != QMessageBox.StandardButton.Yes:
+            return
         params = self._filter_params()
 
         def op(fed: federation.Federation) -> None:
@@ -1263,7 +1271,7 @@ class MainWindow(QMainWindow):
 
     def _delete_dataset(self, name: str) -> None:
         btn = QMessageBox.question(
-            self, "Delete dataset",
+            self, "⚠ Delete dataset",
             f"Remove dataset '{name}' from all attached shards?\n\n"
             "This only removes membership records — images are not deleted.\n"
             "Offline shards will still contain the dataset.",
@@ -1381,7 +1389,12 @@ def main() -> None:
     if len(sys.argv) > 1:
         config = sys.argv[1]
 
+    QApplication.setApplicationName("imgdb")
     app = QApplication.instance() or QApplication(sys.argv)
+
+    _icon_path = os.path.join(os.path.dirname(__file__), "icons", "imgdb_256.png")
+    if os.path.exists(_icon_path):
+        app.setWindowIcon(QIcon(_icon_path))
 
     # Make Ctrl+C close the application cleanly instead of looping.
     # Qt's C++ event loop blocks Python signal delivery between events, so we

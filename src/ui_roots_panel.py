@@ -61,15 +61,14 @@ class RootEntry(QWidget):
         self._cancel: Optional[threading.Event] = None
         self.scan_event.connect(self.update_scan_event)
 
-        self._check_btn = QPushButton()
+        self._check_btn = QPushButton("\U0001f4d6" if checked else "\U0001f4d7")
         self._check_btn.setCheckable(True)
         self._check_btn.setChecked(checked)
-        self._check_btn.setFixedWidth(18)
-        self._check_btn.setFixedHeight(18)
-        self._check_btn.setStyleSheet(
-            "QPushButton { border: 1px solid #888; border-radius: 3px; }"
-            "QPushButton:checked { background: #2980b9; border-color: #2980b9; }"
-        )
+        self._check_btn.setFixedWidth(28)
+        self._check_btn.setFixedHeight(28)
+        self._check_btn.setFlat(True)
+        self._check_btn.setStyleSheet("font-size: 16px; padding: 0;")
+        self._check_btn.toggled.connect(self._on_book_toggled)
         self._check_btn.toggled.connect(lambda v: self.toggled.emit(label, v))
 
         self._name_label = QLabel(f"<b>{label}</b>")
@@ -92,12 +91,10 @@ class RootEntry(QWidget):
         detach_btn.setStyleSheet("color: #888; font-size: 13px;")
         detach_btn.clicked.connect(lambda: self.detach_requested.emit(self._label))
 
-        delete_btn = QPushButton("🗑")
-        delete_btn.setFixedWidth(24)
-        delete_btn.setFixedHeight(24)
+        delete_btn = QPushButton("Delete ❌")
         delete_btn.setFlat(True)
         delete_btn.setToolTip("Delete root (removes database and thumbnails)")
-        delete_btn.setStyleSheet("color: #c0392b; font-size: 13px;")
+        delete_btn.setStyleSheet("color: #c0392b; font-size: 12px;")
         delete_btn.clicked.connect(lambda: self.delete_requested.emit(self._label))
 
         top_row = QHBoxLayout()
@@ -178,6 +175,9 @@ class RootEntry(QWidget):
 
     def is_checked(self) -> bool:
         return self._check_btn.isChecked()
+
+    def _on_book_toggled(self, checked: bool) -> None:
+        self._check_btn.setText("\U0001f4d6" if checked else "\U0001f4d7")
 
     @property
     def abs_path(self) -> str:
@@ -412,7 +412,7 @@ class RootsPanel(QWidget):
 
     def _on_detach_requested(self, label: str) -> None:
         btn = QMessageBox.question(
-            self, "Detach root",
+            self, "⚠ Detach root",
             f"Detach '{label}' from the federation?\n\n"
             "The root folder and its database are not deleted.",
         )

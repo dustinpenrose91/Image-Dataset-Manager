@@ -88,6 +88,7 @@ class AssetTableModel(QAbstractTableModel):
     """
 
     selection_hint = Signal(int)    # row count changed; view may reselect
+    page_loaded    = Signal(int, int)  # first_row, last_row (inclusive)
 
     def __init__(
         self,
@@ -298,6 +299,7 @@ class AssetTableModel(QAbstractTableModel):
                 top = self.index(offset, 0)
                 bot = self.index(offset + len(rows) - 1, NUM_COLS - 1)
                 self.dataChanged.emit(top, bot)
+                self.page_loaded.emit(offset, offset + len(rows) - 1)
 
         def on_error(_exc: BaseException) -> None:
             self._pages_inflight.discard(page)
@@ -465,6 +467,7 @@ class AssetTableView(QTableView):
             hh.resizeSection(col, width)
         hh.setSectionResizeMode(COL_ID, QHeaderView.ResizeMode.Stretch)
         self.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        model.page_loaded.connect(self._on_page_loaded)
 
         # Debounced scroll handler: wait until scrolling settles before bumping
         # thumbnail priorities, so fast scrolling doesn't cause constant reshuffles.
@@ -485,6 +488,11 @@ class AssetTableView(QTableView):
         for col in (COL_PATH, COL_ROOT, COL_DIMS, COL_FORMAT, COL_SIZE):
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(COL_ID, QHeaderView.ResizeMode.Stretch)
+
+    def _on_page_loaded(self, first: int, last: int) -> None:
+        selected = sorted({idx.row() for idx in self.selectedIndexes()})
+        if any(first <= r <= last for r in selected):
+            self._on_selection_changed()
 
     def _on_selection_changed(self, *_) -> None:
         rows = sorted({idx.row() for idx in self.selectedIndexes()})
