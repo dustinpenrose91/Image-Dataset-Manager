@@ -14,8 +14,8 @@ from typing import Optional
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCompleter, QDialog, QFrame, QHBoxLayout, QLabel, QLayout,
-    QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+    QApplication, QCheckBox, QCompleter, QDialog, QFrame, QHBoxLayout, QLabel,
+    QLayout, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
     QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
     QVBoxLayout, QWidget,
 )
@@ -284,23 +284,32 @@ class _TagsSection(QWidget):
 class _CaptionBlock(QWidget):
     """One kind + its always-editable QPlainTextEdit that saves on focus-out."""
 
-    save_requested = Signal(str, str)   # kind, content
-    delete_requested = Signal(str)      # kind
+    save_requested = Signal(str, str)       # kind, content
+    delete_requested = Signal(str)          # kind
+    validated_changed = Signal(str, bool)   # kind, validated
 
-    def __init__(self, kind: str, content: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self, kind: str, content: str, is_validated: bool = False,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self._kind = kind
         self._original = content
 
         kind_row = QHBoxLayout()
         kind_label = QLabel(f"<b>{kind}</b>")
-        kind_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        validated_cb = QCheckBox("Validated")
+        validated_cb.setStyleSheet("font-size: 11px; color: #555;")
+        validated_cb.setChecked(is_validated)
+        validated_cb.toggled.connect(lambda v: self.validated_changed.emit(kind, v))
         del_btn = QPushButton("−")
         del_btn.setFixedWidth(22)
         del_btn.setStyleSheet("color: #c0392b; font-weight: bold;")
         del_btn.setToolTip(f"Delete '{kind}' caption")
         del_btn.clicked.connect(lambda: self.delete_requested.emit(kind))
         kind_row.addWidget(kind_label)
+        kind_row.addWidget(validated_cb)
+        kind_row.addStretch()
         kind_row.addWidget(del_btn)
 
         self._editor = QPlainTextEdit(content)
@@ -341,8 +350,10 @@ class _SingleDetail(QWidget):
     tag_filter_requested = Signal(str)            # tag_name — click chip to filter
     tag_added = Signal(str, str, str)             # asset_id, tag_name, type_name
     tag_removed = Signal(str, str)                # asset_id, tag_id
+    tags_validated_changed = Signal(str, bool)    # asset_id, validated
     caption_saved = Signal(str, str, str)         # asset_id, kind, content
     caption_deleted = Signal(str, str)            # asset_id, kind
+    caption_validated_changed = Signal(str, str, bool)  # asset_id, kind, validated
     import_from_caption_requested = Signal(str)   # asset_id
 
     def __init__(
@@ -375,7 +386,15 @@ class _SingleDetail(QWidget):
         sep1 = _sep()
 
         # Tags
-        tags_header = QLabel("<b>TAGS</b>")
+        tags_header_label = QLabel("<b>TAGS</b>")
+        self._tags_validated_cb = QCheckBox("Validated")
+        self._tags_validated_cb.setStyleSheet("font-size: 11px; color: #555;")
+        self._tags_validated_cb.toggled.connect(self._on_tags_validated_toggled)
+        tags_header_row = QHBoxLayout()
+        tags_header_row.setContentsMargins(0, 0, 0, 0)
+        tags_header_row.addWidget(tags_header_label)
+        tags_header_row.addWidget(self._tags_validated_cb)
+        tags_header_row.addStretch()
         self._tags_section = _TagsSection()
         self._tags_section.tag_added.connect(self._add_tag)
         self._tags_section.tag_removed.connect(self._remove_tag)
@@ -431,7 +450,7 @@ class _SingleDetail(QWidget):
         cl.addWidget(self._meta_label)
         cl.addWidget(self._datasets_label)
         cl.addWidget(sep1)
-        cl.addWidget(tags_header)
+        cl.addLayout(tags_header_row)
         cl.addWidget(self._tags_section)
         cl.addWidget(sep2)
         cl.addWidget(captions_header)
@@ -520,18 +539,20 @@ class _SingleDetail(QWidget):
         def fetch(fed: federation.Federation):
             shard = fed.shards.get(root)
             if shard is None:
-                return [], {}, [], []
+                return [], {}, [], [], False
             tag_rows = imgdb.get_tags_for_asset(shard.conn, aid)
             caps = imgdb.get_captions_for_asset(shard.conn, aid)
             all_types = federation.list_all_tag_types_federation(fed)
             datasets = imgdb.get_dataset_membership(shard.conn, aid)
-            return tag_rows, caps, all_types, datasets
+            tags_validated = imgdb.get_tags_validated(shard.conn, aid)
+            return tag_rows, caps, all_types, datasets, tags_validated
 
         def on_result(data) -> None:
             if self._asset is None or self._asset.asset_id != aid:
                 return
-            tag_rows, caps, all_types, datasets = data
+            tag_rows, caps, all_types, datasets, tags_validated = data
             self._rebuild_tags(tag_rows, all_types)
+            self._tags_validated_cb.setChecked(tags_validated)
             self._rebuild_captions(caps)
             if datasets:
                 self._datasets_label.setText("Datasets: " + ", ".join(datasets))
@@ -544,17 +565,18 @@ class _SingleDetail(QWidget):
     def _rebuild_tags(self, tag_rows: list, all_types: list[str]) -> None:
         self._tags_section.load_tags(tag_rows, all_types)
 
-    def _rebuild_captions(self, caps: dict[str, str]) -> None:
+    def _rebuild_captions(self, caps: dict[str, tuple[str, bool]]) -> None:
         for block in list(self._caption_blocks.values()):
             self._captions_container.removeWidget(block)
             block.deleteLater()
         self._caption_blocks.clear()
-        for kind, content in caps.items():
-            block = _CaptionBlock(kind, content)
+        for kind, (content, is_validated) in caps.items():
+            block = _CaptionBlock(kind, content, is_validated)
             block.save_requested.connect(
                 lambda k, c: self.caption_saved.emit(self._asset.asset_id if self._asset else "", k, c)
             )
             block.delete_requested.connect(self._delete_caption)
+            block.validated_changed.connect(self._on_caption_validated_toggled)
             self._captions_container.addWidget(block)
             self._caption_blocks[kind] = block
 
@@ -567,6 +589,14 @@ class _SingleDetail(QWidget):
         if self._asset:
             self.tag_removed.emit(self._asset.asset_id, tag_id)
             self._load_tags_and_captions(self._asset)
+
+    def _on_tags_validated_toggled(self, checked: bool) -> None:
+        if self._asset:
+            self.tags_validated_changed.emit(self._asset.asset_id, checked)
+
+    def _on_caption_validated_toggled(self, kind: str, checked: bool) -> None:
+        if self._asset:
+            self.caption_validated_changed.emit(self._asset.asset_id, kind, checked)
 
     def _delete_caption(self, kind: str) -> None:
         if self._asset:
@@ -749,8 +779,10 @@ class DetailPanel(QWidget):
     tag_filter_requested = Signal(str)                   # tag_name
     tag_added = Signal(str, str, str)   # asset_id, name, type_name
     tag_removed = Signal(str, str)      # asset_id, tag_id
+    tags_validated_changed = Signal(str, bool)          # asset_id, validated
     caption_saved = Signal(str, str, str)
     caption_deleted = Signal(str, str)
+    caption_validated_changed = Signal(str, str, bool)  # asset_id, kind, validated
     import_from_caption_requested = Signal(str)  # asset_id
     batch_tag_requested = Signal(list)
     batch_remove_tag_requested = Signal(list)            # list[AssetRow]
@@ -785,8 +817,10 @@ class DetailPanel(QWidget):
         self._single.tag_filter_requested.connect(self.tag_filter_requested)
         self._single.tag_added.connect(self.tag_added)
         self._single.tag_removed.connect(self.tag_removed)
+        self._single.tags_validated_changed.connect(self.tags_validated_changed)
         self._single.caption_saved.connect(self.caption_saved)
         self._single.caption_deleted.connect(self.caption_deleted)
+        self._single.caption_validated_changed.connect(self.caption_validated_changed)
         self._single.import_from_caption_requested.connect(
             self.import_from_caption_requested
         )
@@ -875,6 +909,9 @@ class _FlowLayout(QLayout):
 
     def addItem(self, item) -> None:
         self._items.append(item)
+        self.invalidate()
+        if self.parentWidget():
+            self.parentWidget().updateGeometry()
 
     def count(self) -> int:
         return len(self._items)
@@ -883,7 +920,11 @@ class _FlowLayout(QLayout):
         return self._items[index] if 0 <= index < len(self._items) else None
 
     def takeAt(self, index: int):
-        return self._items.pop(index) if 0 <= index < len(self._items) else None
+        item = self._items.pop(index) if 0 <= index < len(self._items) else None
+        self.invalidate()
+        if self.parentWidget():
+            self.parentWidget().updateGeometry()
+        return item
 
     def expandingDirections(self):
         return Qt.Orientation(0)

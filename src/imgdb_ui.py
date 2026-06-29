@@ -280,6 +280,8 @@ class MainWindow(QMainWindow):
         dp.tag_removed.connect(self._remove_tag)
         dp.caption_saved.connect(self._save_caption)
         dp.caption_deleted.connect(self._delete_caption)
+        dp.tags_validated_changed.connect(self._set_tags_validated)
+        dp.caption_validated_changed.connect(self._set_caption_validated)
         dp.batch_tag_requested.connect(self._batch_add_tag)
         dp.batch_remove_tag_requested.connect(self._batch_remove_tag)
         dp.batch_replace_tag_requested.connect(self._batch_replace_tag)
@@ -575,6 +577,20 @@ class MainWindow(QMainWindow):
     def _delete_caption(self, asset_id: str, kind: str) -> None:
         def op(fed: federation.Federation) -> None:
             federation.delete_caption(fed, asset_id, kind)
+
+        self._bridge.submit(op, on_error=self._show_error)
+
+    def _set_tags_validated(self, asset_id: str, validated: bool) -> None:
+        def op(fed: federation.Federation) -> None:
+            shard = federation.shard_for_asset(fed, asset_id)
+            imgdb.set_tags_validated(shard.conn, asset_id, validated)
+
+        self._bridge.submit(op, on_error=self._show_error)
+
+    def _set_caption_validated(self, asset_id: str, kind: str, validated: bool) -> None:
+        def op(fed: federation.Federation) -> None:
+            shard = federation.shard_for_asset(fed, asset_id)
+            imgdb.set_caption_validated(shard.conn, asset_id, kind, validated)
 
         self._bridge.submit(op, on_error=self._show_error)
 
@@ -1198,7 +1214,11 @@ class MainWindow(QMainWindow):
             def op(fed: federation.Federation) -> None:
                 federation.add_to_dataset(fed, name, [asset_id])
 
-            self._bridge.submit(op, on_result=lambda _: self._refresh_datasets(), on_error=self._show_error)
+            def on_done(_) -> None:
+                self._refresh_datasets()
+                self._detail_panel.load_selection(self._selected_assets, self._fed)
+
+            self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
         self._bridge.submit(fetch, on_result=on_names, on_error=self._show_error)
 

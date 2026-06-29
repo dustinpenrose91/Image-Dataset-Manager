@@ -135,19 +135,20 @@ class ScanSummary:
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS assets (
-    asset_id     TEXT PRIMARY KEY,
-    rel_path     TEXT NOT NULL UNIQUE,
-    current_hash TEXT NOT NULL,
-    phash        INTEGER,
-    width        INTEGER,
-    height       INTEGER,
-    format       TEXT,
-    bytes        INTEGER,
-    mtime_ns     INTEGER,
-    last_seen    TIMESTAMP,
-    exists_flag  INTEGER DEFAULT 1,
-    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    asset_id       TEXT PRIMARY KEY,
+    rel_path       TEXT NOT NULL UNIQUE,
+    current_hash   TEXT NOT NULL,
+    phash          INTEGER,
+    width          INTEGER,
+    height         INTEGER,
+    format         TEXT,
+    bytes          INTEGER,
+    mtime_ns       INTEGER,
+    last_seen      TIMESTAMP,
+    exists_flag    INTEGER DEFAULT 1,
+    tags_validated INTEGER NOT NULL DEFAULT 0,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_assets_hash  ON assets(current_hash);
 CREATE INDEX IF NOT EXISTS idx_assets_phash ON assets(phash);
@@ -165,6 +166,7 @@ CREATE TABLE IF NOT EXISTS captions (
     asset_id     TEXT NOT NULL REFERENCES assets(asset_id) ON DELETE CASCADE,
     kind         TEXT NOT NULL,
     content      TEXT NOT NULL,
+    is_validated INTEGER NOT NULL DEFAULT 0,
     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (asset_id, kind)
 );
@@ -270,6 +272,16 @@ def connect(db_path: str | os.PathLike, read_only: bool = False) -> sqlite3.Conn
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply incremental column additions to existing shards."""
+    asset_cols = {row[1] for row in conn.execute("PRAGMA table_info(assets)")}
+    if "tags_validated" not in asset_cols:
+        conn.execute("ALTER TABLE assets ADD COLUMN tags_validated INTEGER NOT NULL DEFAULT 0")
+    caption_cols = {row[1] for row in conn.execute("PRAGMA table_info(captions)")}
+    if "is_validated" not in caption_cols:
+        conn.execute("ALTER TABLE captions ADD COLUMN is_validated INTEGER NOT NULL DEFAULT 0")
+
+
 def init_shard(root_abs_path: str) -> sqlite3.Connection:
     """
     Open (creating if needed) a shard for the given root and apply the
@@ -280,6 +292,7 @@ def init_shard(root_abs_path: str) -> sqlite3.Connection:
     conn = connect(shard_db_path(root_abs_path))
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA_SQL)
+    _migrate(conn)
     return conn
 
 
@@ -872,15 +885,43 @@ def get_tags_for_asset(
 
 def get_captions_for_asset(
     conn: sqlite3.Connection, asset_id: str
-) -> dict[str, str]:
-    """Return {kind: content} for all captions belonging to an asset."""
+) -> dict[str, tuple[str, bool]]:
+    """Return {kind: (content, is_validated)} for all captions belonging to an asset."""
     return {
-        r["kind"]: r["content"]
+        r["kind"]: (r["content"], bool(r["is_validated"]))
         for r in conn.execute(
-            "SELECT kind, content FROM captions WHERE asset_id = ? ORDER BY kind",
+            "SELECT kind, content, is_validated FROM captions WHERE asset_id = ? ORDER BY kind",
             (asset_id,),
         )
     }
+
+
+def get_tags_validated(conn: sqlite3.Connection, asset_id: str) -> bool:
+    """Return whether the tags for an asset have been validated."""
+    row = conn.execute(
+        "SELECT tags_validated FROM assets WHERE asset_id = ?", (asset_id,)
+    ).fetchone()
+    return bool(row["tags_validated"]) if row else False
+
+
+def set_tags_validated(
+    conn: sqlite3.Connection, asset_id: str, validated: bool
+) -> None:
+    with transaction(conn):
+        conn.execute(
+            "UPDATE assets SET tags_validated = ? WHERE asset_id = ?",
+            (1 if validated else 0, asset_id),
+        )
+
+
+def set_caption_validated(
+    conn: sqlite3.Connection, asset_id: str, kind: str, validated: bool
+) -> None:
+    with transaction(conn):
+        conn.execute(
+            "UPDATE captions SET is_validated = ? WHERE asset_id = ? AND kind = ?",
+            (1 if validated else 0, asset_id, kind),
+        )
 
 
 def get_dataset_membership(
@@ -1204,8 +1245,11 @@ def remove_from_dataset(
 def rename_dataset(conn: sqlite3.Connection, old_name: str, new_name: str) -> None:
     """Rename a dataset within this shard (both the header row and all memberships)."""
     with transaction(conn):
-        conn.execute("UPDATE dataset_assets SET dataset_name = ? WHERE dataset_name = ?", (new_name, old_name))
+        # defer_foreign_keys delays FK checks to commit time so both tables can
+        # be updated within a single transaction without a transient violation.
+        conn.execute("PRAGMA defer_foreign_keys = ON")
         conn.execute("UPDATE datasets SET name = ? WHERE name = ?", (new_name, old_name))
+        conn.execute("UPDATE dataset_assets SET dataset_name = ? WHERE dataset_name = ?", (new_name, old_name))
 
 
 def delete_dataset(conn: sqlite3.Connection, name: str) -> None:

@@ -162,7 +162,8 @@ class _Canvas(QWidget):
         if self._source is None:
             return
         if self._fit_pending and self.width() > 0 and self.height() > 0:
-            self._zoom = min(self.width() / self._source.width(),
+            self._zoom = min(1.0,
+                             self.width() / self._source.width(),
                              self.height() / self._source.height())
             self._fit_pending = False
         p = QPainter(self)
@@ -238,7 +239,7 @@ class _Canvas(QWidget):
                 self._last_draw = ip
         elif self._mode == _Mode.CROP:
             if event.button() == Qt.MouseButton.LeftButton:
-                self._crop_start = self._widget_to_image(pos)
+                self._crop_start = self._clamp_to_image(self._widget_to_image(pos))
                 self._crop_rect  = None
                 self._crop_drag  = True
 
@@ -260,7 +261,7 @@ class _Canvas(QWidget):
             self._last_draw = ip
 
         elif self._crop_drag and self._crop_start is not None:
-            end = self._widget_to_image(pos)
+            end = self._clamp_to_image(self._widget_to_image(pos))
             start = self._crop_start
             self._crop_rect = QRect(
                 QPoint(int(start.x()), int(start.y())),
@@ -310,7 +311,8 @@ class _Canvas(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if self._source is not None and not self._user_zoomed:
-            self._zoom = min(self.width() / self._source.width(),
+            self._zoom = min(1.0,
+                             self.width() / self._source.width(),
                              self.height() / self._source.height())
             self._fit_pending = False
         self.update()
@@ -334,6 +336,14 @@ class _Canvas(QWidget):
         return QPointF(
             (wp.x() - r.x()) / self._zoom,
             (wp.y() - r.y()) / self._zoom,
+        )
+
+    def _clamp_to_image(self, p: QPointF) -> QPointF:
+        if self._source is None:
+            return p
+        return QPointF(
+            max(0.0, min(p.x(), float(self._source.width()))),
+            max(0.0, min(p.y(), float(self._source.height()))),
         )
 
     def _image_to_widget(self, ip: QPointF) -> QPointF:
