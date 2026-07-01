@@ -23,24 +23,24 @@ import os
 import sys
 from typing import Optional
 
-from PySide6.QtCore import QItemSelectionModel, QSettings, QStringListModel, QTimer, Qt
+from PySide6.QtCore import QItemSelectionModel, QSettings, QTimer, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QSplitter, QStackedWidget, QStatusBar, QTabWidget, QToolBar,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDialog, QHBoxLayout, QInputDialog, QLabel,
+    QMainWindow, QMessageBox, QPushButton, QSpinBox, QSplitter,
+    QStackedWidget, QStatusBar, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
 import federation
 import imgdb
 import imgdb_thumbs
+from filter_model import FilterRule, SortRule
 from imgdb_thumbs_qt import QtThumbnailBridge
 from imgdb_worker import DBWorker
 from imgdb_worker_qt import QtDBBridge
 from ui_asset_table import AssetTableModel, AssetTableView
-from ui_datasets_panel import DatasetsPanel
 from ui_detail_panel import DetailPanel
+from ui_filter_panel import FilterPanel
 from ui_dialogs import (
     AddToDatasetDialog, AmbiguousTagResolutionDialog,
     BatchMoveDialog, BatchRemoveTagDialog, BatchReplaceTagDialog, BatchTagDialog,
@@ -62,11 +62,9 @@ class MainWindow(QMainWindow):
         self._fed: Optional[federation.Federation] = None
         self._worker: Optional[DBWorker] = None
         self._bridge: Optional[QtDBBridge] = None
-        self._active_dataset: Optional[str] = None
         self._tag_suggestions: list = []
         self._tag_types: list[str] = ["General"]
         self._selected_assets: list[federation.AssetRow] = []
-        self._active_tag_filters: list[str] = []
         self._thumb_worker = imgdb_thumbs.ThumbnailWorker()
         self._thumb_bridge: Optional[QtThumbnailBridge] = None
 
@@ -139,57 +137,13 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._import_btn)
         toolbar.addSeparator()
 
-        # Filter bar widgets (only shown in Browse mode)
-        self._filter_bar = QWidget()
-        fb_layout = QHBoxLayout(self._filter_bar)
-        fb_layout.setContentsMargins(0, 0, 0, 0)
-        fb_layout.setSpacing(6)
-
-        fb_layout.addWidget(QLabel("Tag"))
-        self._tag_filter_edit = QLineEdit()
-        self._tag_filter_edit.setPlaceholderText("filter by tag")
-        self._tag_filter_edit.setClearButtonEnabled(True)
-        self._tag_filter_edit.setFixedWidth(160)
-        self._tag_filter_edit.returnPressed.connect(self._apply_filter)
-        self._tag_filter_edit.textChanged.connect(
-            lambda text: self._apply_filter() if not text else None
-        )
-        fb_layout.addWidget(self._tag_filter_edit)
-
-        fb_layout.addWidget(QLabel("WHERE"))
-        self._where_edit = QLineEdit()
-        self._where_edit.setPlaceholderText("e.g.  format = 'PNG'  or  width > 1000")
-        self._where_edit.setClearButtonEnabled(True)
-        fb_layout.addWidget(self._where_edit, stretch=1)
-
-        fb_layout.addWidget(QLabel("Sort"))
-        self._sort_combo = QComboBox()
-        for col in sorted(federation.SORTABLE_COLUMNS):
-            self._sort_combo.addItem(col)
-        self._sort_combo.setCurrentText("rel_path")
-        fb_layout.addWidget(self._sort_combo)
-
-        self._sort_desc_btn = QPushButton("↓")
-        self._sort_desc_btn.setCheckable(True)
-        self._sort_desc_btn.setFixedWidth(28)
-        self._sort_desc_btn.setToolTip("Sort descending")
-        fb_layout.addWidget(self._sort_desc_btn)
-
-        self._show_missing_cb = QCheckBox("Show missing")
-        fb_layout.addWidget(self._show_missing_cb)
-
-        self._apply_filter_btn = QPushButton("Apply")
-        self._apply_filter_btn.setFixedWidth(60)
-        fb_layout.addWidget(self._apply_filter_btn)
-
-        toolbar.addWidget(self._filter_bar)
 
         # Status bar
         self._status_bar = QStatusBar(self)
         self.setStatusBar(self._status_bar)
         self._asset_count_label = QLabel("0 assets")
         self._thumb_queue_label = QLabel()
-        self._status_bar.addWidget(self._asset_count_label)
+        self._status_bar.addPermanentWidget(self._asset_count_label)
         self._status_bar.addPermanentWidget(self._thumb_queue_label)
 
         # Main stacked area
@@ -205,16 +159,52 @@ class MainWindow(QMainWindow):
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.setChildrenCollapsible(False)
 
-        # Left sidebar: roots on top, datasets below
-        self._left_splitter = QSplitter(Qt.Orientation.Vertical)
-        self._left_splitter.setChildrenCollapsible(False)
+        # Left panel — tabbed: Browse (FilterPanel) | Config (Roots + Datasets)
+        self._left_tabs = QTabWidget()
+        self._left_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self._left_tabs.setDocumentMode(True)
+
+        self._filter_panel = FilterPanel()
+        self._left_tabs.addTab(self._filter_panel, "Browse")
+
+        config_widget = QWidget()
+        config_layout = QVBoxLayout(config_widget)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(0)
         self._roots_panel = RootsPanel(self._bridge)
-        self._datasets_panel = DatasetsPanel()
-        self._left_splitter.addWidget(self._roots_panel)
-        self._left_splitter.addWidget(self._datasets_panel)
-        self._left_splitter.setStretchFactor(0, 2)
-        self._left_splitter.setStretchFactor(1, 1)
-        self._splitter.addWidget(self._left_splitter)
+        config_layout.addWidget(self._roots_panel, stretch=2)
+
+        worker_header = QLabel("Worker Settings")
+        worker_header.setStyleSheet("font-weight: bold; padding: 6px 4px 2px 4px;")
+        config_layout.addWidget(worker_header)
+
+        self._backfill_cb = QCheckBox("Auto-compute perceptual hashes")
+        self._backfill_cb.setToolTip(
+            "On startup, queue background computation of perceptual hashes\n"
+            "for any assets that don't have one yet."
+        )
+        self._batch_size_spin = QSpinBox()
+        self._batch_size_spin.setRange(1, 200)
+        self._batch_size_spin.setFixedWidth(60)
+        self._batch_size_spin.setToolTip(
+            "How many assets are processed per background worker job.\n"
+            "Smaller batches keep the app more responsive."
+        )
+        batch_row = QHBoxLayout()
+        batch_row.addWidget(QLabel("Assets per batch:"))
+        batch_row.addWidget(self._batch_size_spin)
+        batch_row.addStretch()
+
+        worker_inner = QWidget()
+        worker_inner_layout = QVBoxLayout(worker_inner)
+        worker_inner_layout.setContentsMargins(4, 0, 4, 4)
+        worker_inner_layout.addWidget(self._backfill_cb)
+        worker_inner_layout.addLayout(batch_row)
+        config_layout.addWidget(worker_inner)
+
+        self._left_tabs.addTab(config_widget, "Config")
+
+        self._splitter.addWidget(self._left_tabs)
 
         self._table_model = AssetTableModel(self._bridge, self._thumb_bridge)
         self._table_view = AssetTableView(self._table_model)
@@ -250,9 +240,10 @@ class MainWindow(QMainWindow):
         self._preview_btn.clicked.connect(self._toggle_preview)
         self._import_btn.clicked.connect(self._bulk_import)
 
-        # Filter bar
-        self._apply_filter_btn.clicked.connect(self._apply_filter)
-        self._where_edit.returnPressed.connect(self._apply_filter)
+        # Filter panel
+        self._filter_panel.filter_changed.connect(self._apply_filter)
+        self._filter_panel.rename_dataset_requested.connect(self._rename_dataset)
+        self._filter_panel.delete_dataset_requested.connect(self._delete_dataset)
 
         # Roots panel
         self._roots_panel.roots_changed.connect(self._on_roots_changed)
@@ -260,6 +251,7 @@ class MainWindow(QMainWindow):
 
         # Table selection → detail panel + preview
         self._table_view.selection_changed.connect(self._on_selection_changed)
+        self._table_view.context_menu_requested.connect(self._on_asset_context_menu)
         # Double-click opens the preview window.
         self._table_view.doubleClicked.connect(self._on_table_double_click)
         # Keep toolbar button in sync when the window is closed via Escape/X.
@@ -290,7 +282,7 @@ class MainWindow(QMainWindow):
         dp.add_to_dataset_requested.connect(self._add_to_dataset)
         dp.batch_add_to_dataset_requested.connect(self._batch_add_to_dataset)
         dp.remove_from_dataset_requested.connect(self._remove_from_dataset)
-        dp.tag_filter_requested.connect(self._set_tag_filter)
+        dp.tag_filter_requested.connect(self._add_tag_filter)
         dp.batch_remove_from_dataset_requested.connect(self._batch_remove_from_dataset)
         dp.merge_two_requested.connect(self._merge_two)
         dp.import_from_caption_requested.connect(self._import_from_caption)
@@ -304,13 +296,16 @@ class MainWindow(QMainWindow):
         tp.add_to_filtered_requested.connect(self._tm_add_to_filtered)
         tp.remove_from_selection_requested.connect(self._tm_remove_from_selection)
         tp.remove_from_filtered_requested.connect(self._tm_remove_from_filtered)
-        tp.tag_filters_changed.connect(self._on_tag_filters_changed)
+        tp.add_as_filter_requested.connect(self._on_add_as_filter)
         self._right_tabs.currentChanged.connect(self._on_right_tab_changed)
 
-        # Datasets panel
-        self._datasets_panel.dataset_filter_changed.connect(self._on_dataset_filter_changed)
-        self._datasets_panel.rename_dataset_requested.connect(self._rename_dataset)
-        self._datasets_panel.delete_dataset_requested.connect(self._delete_dataset)
+        # Preview window signals → DB updates
+        self._preview_win.mask_saved.connect(self._on_mask_saved)
+        self._preview_win.perceptual_hash_ready.connect(self._on_perceptual_hash_ready)
+
+        # Worker settings changes → persist immediately
+        self._backfill_cb.toggled.connect(lambda _: self._save_settings())
+        self._batch_size_spin.valueChanged.connect(lambda _: self._save_settings())
 
         # Query tab — save result as dataset
         self._query_tab.save_as_dataset_requested.connect(self._save_as_dataset)
@@ -334,6 +329,8 @@ class MainWindow(QMainWindow):
             self._apply_filter()
             self._refresh_datasets()
             self._refresh_tag_suggestions()
+            self._repair_has_mask()
+            self._start_phash_backfill()
 
         def on_error(exc: BaseException) -> None:
             self._status_bar.showMessage(f"Failed to open federation: {exc}", 0)
@@ -356,6 +353,8 @@ class MainWindow(QMainWindow):
             self._apply_filter()
             self._refresh_datasets()
             self._refresh_tag_suggestions()
+            self._repair_has_mask()
+            self._start_phash_backfill()
 
         self._bridge.submit(reopen, on_result=on_ready)
 
@@ -363,42 +362,18 @@ class MainWindow(QMainWindow):
     # Filter
     # -----------------------------------------------------------------------
 
-    def _combined_tag_filters(self) -> Optional[list[str]]:
-        bar = self._tag_filter_edit.text().strip()
-        combined = ([bar] if bar else []) + self._active_tag_filters
-        return combined or None
-
-    def _filter_params(self) -> dict:
-        """Return the filter state dict used by list_tags_for_filtered_assets."""
-        return {
-            "checked_labels": self._roots_panel.checked_labels(),
-            "where_clause": self._where_edit.text().strip() or None,
-            "show_missing": self._show_missing_cb.isChecked(),
-            "dataset_name": self._active_dataset,
-            "tag_filter": self._combined_tag_filters(),
-        }
-
     def _apply_filter(self, _=None) -> None:
-        checked = self._roots_panel.checked_labels()
-        where = self._where_edit.text().strip() or None
-        sort_by = self._sort_combo.currentText()
-        sort_desc = self._sort_desc_btn.isChecked()
-        show_missing = self._show_missing_cb.isChecked()
         self._table_model.refresh(
-            checked_labels=checked,
-            where=where,
-            sort_by=sort_by,
-            sort_desc=sort_desc,
-            show_missing=show_missing,
-            dataset_name=self._active_dataset,
-            tag_filter=self._combined_tag_filters(),
+            checked_labels=self._roots_panel.checked_labels(),
+            filter_rules=self._filter_panel.current_filter_rules(),
+            sort_rules=self._filter_panel.current_sort_rules(),
         )
+        # Keep the detail panel's active-dataset context in sync with the
+        # first checked dataset (used for "Remove from [X]" button).
+        checked_ds = self._filter_panel.checked_dataset_names()
+        self._detail_panel.set_active_dataset(checked_ds[0] if checked_ds else None)
         if self._right_tabs.currentIndex() == 1:
             self._refresh_tag_list()
-
-    def _on_tag_filters_changed(self, filters: list[str]) -> None:
-        self._active_tag_filters = filters
-        self._apply_filter()
 
     def _apply_filter_preserving_scroll(self) -> None:
         """Like _apply_filter, but restores the viewport position after the
@@ -448,7 +423,6 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(index)
         self._browse_btn.setChecked(index == 0)
         self._query_btn.setChecked(index == 1)
-        self._filter_bar.setVisible(index == 0)
 
     # -----------------------------------------------------------------------
     # Selection
@@ -459,6 +433,21 @@ class MainWindow(QMainWindow):
         self._detail_panel.load_selection(assets, self._fed)
         if self._preview_win.isVisible() and assets:
             self._load_preview(assets[0])
+
+    def _on_asset_context_menu(self, menu, assets: list[federation.AssetRow]) -> None:
+        """
+        Extend the right-click menu with row-level actions.
+        The view has already populated copy actions; add a separator then
+        anything that requires federation access (merge, delete, datasets, …).
+
+        Pattern:
+            if menu.actions():
+                menu.addSeparator()
+            act = menu.addAction("Some Action")
+            act.triggered.connect(lambda: self._some_method(assets))
+        """
+        if not assets or not menu:
+            return
 
     def _on_table_double_click(self, index) -> None:
         asset = self._table_model.row_data(index.row())
@@ -480,15 +469,15 @@ class MainWindow(QMainWindow):
                 if rel.startswith("../"):
                     continue
                 row = shard.conn.execute(
-                    "SELECT asset_id, current_hash FROM assets WHERE rel_path = ?",
+                    "SELECT asset_id, file_hash FROM assets WHERE rel_path = ?",
                     (rel,),
                 ).fetchone()
                 if row:
                     lq = imgdb_thumbs.thumb_path(
-                        shard.abs_path, row["asset_id"], row["current_hash"]
+                        shard.abs_path, row["asset_id"], row["file_hash"]
                     )
                     hq = imgdb_thumbs.thumb_path_hq(
-                        shard.abs_path, row["asset_id"], row["current_hash"]
+                        shard.abs_path, row["asset_id"], row["file_hash"]
                     )
                     for path in (lq, hq):
                         try:
@@ -522,7 +511,10 @@ class MainWindow(QMainWindow):
         if shard is None:
             return
         abs_path = os.path.join(shard.abs_path, asset.rel_path)
-        self._preview_win.set_image(abs_path, asset.rel_path)
+        self._preview_win.set_image(
+            abs_path, asset.rel_path,
+            needs_phash=asset.perceptual_hash is None,
+        )
 
     def _toggle_preview(self, checked: bool) -> None:
         if checked:
@@ -587,6 +579,124 @@ class MainWindow(QMainWindow):
 
         self._bridge.submit(op, on_error=self._show_error)
 
+    def _on_mask_saved(self, abs_path: str, has_mask: bool) -> None:
+        def op(fed: federation.Federation) -> None:
+            for shard in fed.shards.values():
+                try:
+                    rel = os.path.relpath(abs_path, shard.abs_path).replace(os.sep, "/")
+                except ValueError:
+                    continue
+                if rel.startswith("../"):
+                    continue
+                row = shard.conn.execute(
+                    "SELECT asset_id FROM assets WHERE rel_path = ?", (rel,)
+                ).fetchone()
+                if row:
+                    imgdb.set_has_mask(shard.conn, row["asset_id"], has_mask)
+                    return
+
+        self._bridge.submit(op, on_error=self._show_error)
+
+    def _on_perceptual_hash_ready(self, abs_path: str, phash: str) -> None:
+        """Write a perceptual hash computed by the preview window into the DB."""
+        def op(fed: federation.Federation) -> None:
+            for shard in fed.shards.values():
+                try:
+                    rel = os.path.relpath(abs_path, shard.abs_path).replace(os.sep, "/")
+                except ValueError:
+                    continue
+                if rel.startswith("../"):
+                    continue
+                row = shard.conn.execute(
+                    "SELECT asset_id FROM assets WHERE rel_path = ?", (rel,)
+                ).fetchone()
+                if row:
+                    imgdb.set_perceptual_hash(shard.conn, row["asset_id"], phash)
+                    return
+
+        self._bridge.submit(op, on_error=self._show_error)
+
+    def _repair_has_mask(self) -> None:
+        """Fix assets where has_mask=0 but a mask file exists on disk.
+
+        Runs once at startup to repair records predating the has_mask column.
+        Recurses until no more repairs are found so large libraries are handled
+        without blocking the worker.
+        """
+        def op(fed: federation.Federation) -> int:
+            return federation.repair_missing_has_mask(fed)
+
+        def on_result(repaired: int) -> None:
+            if repaired > 0:
+                self._apply_filter()
+                self._repair_has_mask()
+
+        self._bridge.submit(op, on_result=on_result, on_error=self._show_error)
+
+    def _start_phash_backfill(self) -> None:
+        """Entry point: query total missing count, then start the batch loop."""
+        if not self._backfill_cb.isChecked():
+            return
+
+        def count_op(fed: federation.Federation) -> int:
+            return federation.count_assets_missing_perceptual_hash(fed)
+
+        def on_count(total: int) -> None:
+            if total == 0:
+                return
+            self._backfill_done = 0
+            self._backfill_total = total
+            self._run_phash_batch()
+
+        self._bridge.submit(count_op, on_result=on_count, on_error=self._show_error)
+
+    def _run_phash_batch(self) -> None:
+        """Process one batch of perceptual hashes; reschedules itself until done."""
+        batch_size = self._batch_size_spin.value()
+        # Capture filter state on the main thread before handing off to worker.
+        priority_labels = self._roots_panel.checked_labels()
+        priority_rules = self._filter_panel.current_filter_rules()
+
+        def op(fed: federation.Federation) -> tuple[int, bool]:
+            missing = federation.list_assets_missing_perceptual_hash(
+                fed, batch_size,
+                priority_labels=priority_labels,
+                priority_rules=priority_rules,
+            )
+            for asset_id, rel_path, label in missing:
+                shard = fed.shards.get(label)
+                if shard is None:
+                    continue
+                abs_path = os.path.join(shard.abs_path, rel_path)
+                phash = imgdb.compute_perceptual_hash(abs_path)
+                # Write PHASH_FAILED sentinel (not NULL) when hashing fails so
+                # the file is excluded from future backfill batches. NULL means
+                # "not yet attempted" and would re-queue the same file forever.
+                imgdb.set_perceptual_hash(
+                    shard.conn, asset_id, phash if phash is not None else imgdb.PHASH_FAILED
+                )
+            return len(missing), len(missing) < batch_size
+
+        def on_result(result: tuple[int, bool]) -> None:
+            n, complete = result
+            self._backfill_done = getattr(self, "_backfill_done", 0) + n
+            done = self._backfill_done
+            grand = getattr(self, "_backfill_total", done)
+            if not complete and self._bridge.is_running:
+                self._status_bar.showMessage(
+                    f"Computing perceptual hashes… ({done:,} of {grand:,})"
+                )
+                self._run_phash_batch()
+            else:
+                self._backfill_done = 0
+                self._backfill_total = 0
+                if done > 0:
+                    self._status_bar.showMessage(
+                        f"Perceptual hash backfill complete ({done:,} computed)", 5000
+                    )
+
+        self._bridge.submit(op, on_result=on_result, on_error=self._show_error)
+
     def _set_caption_validated(self, asset_id: str, kind: str, validated: bool) -> None:
         def op(fed: federation.Federation) -> None:
             shard = federation.shard_for_asset(fed, asset_id)
@@ -596,7 +706,7 @@ class MainWindow(QMainWindow):
 
     def _import_from_caption(self, asset_id: str) -> None:
         checked = self._roots_panel.checked_labels()
-        filter_params = self._filter_params()
+        rules = self._filter_panel.current_filter_rules()
 
         def fetch(fed: federation.Federation) -> tuple:
             tag_lookup = federation.build_tag_lookup(fed)
@@ -607,17 +717,8 @@ class MainWindow(QMainWindow):
             ).fetchall()
             caption_texts = {r["kind"]: (r["content"] or "") for r in cap_rows}
             all_kinds = federation.list_all_caption_kinds(fed, checked)
-            filtered_count = federation.count_filtered_assets(
-                fed,
-                checked_labels=filter_params["checked_labels"],
-                where_clause=filter_params.get("where_clause"),
-                show_missing=filter_params.get("show_missing", False),
-                dataset_name=filter_params.get("dataset_name"),
-                tag_filter=filter_params.get("tag_filter"),
-            )
-            total_count = federation.count_filtered_assets(
-                fed, checked_labels=checked, show_missing=False
-            )
+            filtered_count = federation.count_filtered_assets(fed, checked, rules)
+            total_count = federation.count_filtered_assets(fed, checked, [])
             return tag_lookup, caption_texts, all_kinds, filtered_count, total_count
 
         def on_fetch(data: tuple) -> None:
@@ -670,18 +771,14 @@ class MainWindow(QMainWindow):
                 bulk_kwargs: dict = dict(
                     caption_kind=caption_kind,
                     tag_lookup=tag_lookup,
-                    checked_labels=filter_params["checked_labels"],
-                    where_clause=filter_params.get("where_clause"),
-                    show_missing=filter_params.get("show_missing", False),
-                    dataset_name=filter_params.get("dataset_name"),
-                    tag_filter=filter_params.get("tag_filter"),
+                    checked_labels=checked,
+                    filter_rules=rules,
                 )
             else:  # "all" — all assets in checked shards, no other filter
                 bulk_kwargs = dict(
                     caption_kind=caption_kind,
                     tag_lookup=tag_lookup,
                     checked_labels=checked,
-                    show_missing=False,
                 )
 
             def _do_bulk_import(resolution: dict) -> None:
@@ -1046,21 +1143,17 @@ class MainWindow(QMainWindow):
             self._tag_suggestions = tags
             self._tag_types = types
             self._detail_panel.set_tag_suggestions(tags)
-            c = QCompleter(self._tag_filter_edit)
-            c.setModel(QStringListModel([n for n, *_ in tags], c))
-            c.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-            c.setFilterMode(Qt.MatchFlag.MatchContains)
-            c.activated.connect(lambda _: self._apply_filter())
-            self._tag_filter_edit.setCompleter(c)
+            self._filter_panel.set_tag_names([n for n, *_ in tags])
 
         self._bridge.submit(op, on_result=on_ready)
 
     def _refresh_tag_list(self) -> None:
         """Populate the Tag Management panel with tags matching the current filter."""
-        params = self._filter_params()
+        labels = self._roots_panel.checked_labels()
+        rules = self._filter_panel.current_filter_rules()
 
         def op(fed: federation.Federation) -> list[tuple[str, str, int]]:
-            return federation.list_tags_for_filtered_assets(fed, **params)
+            return federation.list_tags_for_filtered_assets(fed, labels, rules)
 
         self._bridge.submit(op, on_result=self._tag_panel.load_tags)
 
@@ -1146,10 +1239,11 @@ class MainWindow(QMainWindow):
         )
         if btn != QMessageBox.StandardButton.Yes:
             return
-        params = self._filter_params()
+        labels = self._roots_panel.checked_labels()
+        rules = self._filter_panel.current_filter_rules()
 
         def op(fed: federation.Federation) -> None:
-            federation.add_tag_to_filtered_assets(fed, tag_name, type_name, params)
+            federation.add_tag_to_filtered_assets(fed, tag_name, type_name, labels, rules)
 
         def on_done(_) -> None:
             self._refresh_tag_suggestions()
@@ -1172,10 +1266,11 @@ class MainWindow(QMainWindow):
         self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
     def _tm_remove_from_filtered(self, tag_name: str, type_name: str) -> None:
-        params = self._filter_params()
+        labels = self._roots_panel.checked_labels()
+        rules = self._filter_panel.current_filter_rules()
 
         def op(fed: federation.Federation) -> None:
-            federation.remove_tag_from_filtered_assets(fed, tag_name, type_name, params)
+            federation.remove_tag_from_filtered_assets(fed, tag_name, type_name, labels, rules)
 
         def on_done(_) -> None:
             self._refresh_tag_suggestions()
@@ -1188,18 +1283,18 @@ class MainWindow(QMainWindow):
             return federation.list_datasets_federation(fed)
 
         def on_ready(datasets: list[federation.DatasetInfo]) -> None:
-            self._datasets_panel.load_datasets(datasets)
+            self._filter_panel.set_datasets([ds.name for ds in datasets])
 
         self._bridge.submit(op, on_result=on_ready)
 
-    def _set_tag_filter(self, tag: str) -> None:
-        self._tag_filter_edit.setText(tag)
-        self._apply_filter()
+    def _add_tag_filter(self, tag: str) -> None:
+        """Add a 'tag has <name>' filter rule to the browse panel."""
+        self._filter_panel.add_filter_rule(FilterRule("tag", "has", tag))
+        self._left_tabs.setCurrentIndex(0)  # switch to Browse tab
 
-    def _on_dataset_filter_changed(self, name: Optional[str]) -> None:
-        self._active_dataset = name
-        self._detail_panel.set_active_dataset(name)
-        self._apply_filter_preserving_scroll()
+    def _on_add_as_filter(self, tag_name: str, type_name: str) -> None:
+        self._filter_panel.add_filter_rule(FilterRule("tag", "has", tag_name))
+        self._left_tabs.setCurrentIndex(0)
 
     def _add_to_dataset(self, asset_id: str) -> None:
         def fetch(fed: federation.Federation) -> list[str]:
@@ -1209,10 +1304,11 @@ class MainWindow(QMainWindow):
             dlg = AddToDatasetDialog(names, self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
-            name = dlg.dataset_name()
+            dataset_names = dlg.dataset_names()
 
             def op(fed: federation.Federation) -> None:
-                federation.add_to_dataset(fed, name, [asset_id])
+                for name in dataset_names:
+                    federation.add_to_dataset(fed, name, [asset_id])
 
             def on_done(_) -> None:
                 self._refresh_datasets()
@@ -1232,10 +1328,11 @@ class MainWindow(QMainWindow):
             dlg = AddToDatasetDialog(names, self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
-            name = dlg.dataset_name()
+            dataset_names = dlg.dataset_names()
 
             def op(fed: federation.Federation) -> None:
-                federation.add_to_dataset(fed, name, asset_ids)
+                for name in dataset_names:
+                    federation.add_to_dataset(fed, name, asset_ids)
 
             self._bridge.submit(op, on_result=lambda _: self._refresh_datasets(), on_error=self._show_error)
 
@@ -1253,17 +1350,15 @@ class MainWindow(QMainWindow):
             federation.rename_dataset(fed, old_name, new_name)
 
         def on_done(_) -> None:
-            if self._active_dataset == old_name:
-                self._active_dataset = new_name
-                self._detail_panel.set_active_dataset(new_name)
             self._refresh_datasets()
 
         self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
     def _remove_from_dataset(self, asset_id: str) -> None:
-        name = self._active_dataset
-        if not name:
+        checked = self._filter_panel.checked_dataset_names()
+        if not checked:
             return
+        name = checked[0]
 
         def op(fed: federation.Federation) -> None:
             federation.remove_from_dataset(fed, name, [asset_id])
@@ -1275,9 +1370,10 @@ class MainWindow(QMainWindow):
         )
 
     def _batch_remove_from_dataset(self, assets: list[federation.AssetRow]) -> None:
-        name = self._active_dataset
-        if not name:
+        checked = self._filter_panel.checked_dataset_names()
+        if not checked:
             return
+        name = checked[0]
         asset_ids = [a.asset_id for a in assets]
 
         def op(fed: federation.Federation) -> None:
@@ -1303,9 +1399,6 @@ class MainWindow(QMainWindow):
             return federation.delete_dataset(fed, name)
 
         def on_done(affected: list[str]) -> None:
-            if self._active_dataset == name:
-                self._active_dataset = None
-                self._datasets_panel.clear_filter()
             self._refresh_datasets()
             self._apply_filter()
             self._status_bar.showMessage(
@@ -1323,15 +1416,20 @@ class MainWindow(QMainWindow):
             dlg.setWindowTitle("Save query as dataset…")
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
-            name = dlg.dataset_name()
+            dataset_names = dlg.dataset_names()
 
-            def op(fed: federation.Federation) -> int:
-                return federation.add_to_dataset_from_query(fed, name, sql)
+            def op(fed: federation.Federation) -> dict[str, int]:
+                return {
+                    name: federation.add_to_dataset_from_query(fed, name, sql)
+                    for name in dataset_names
+                }
 
-            def on_done(count: int) -> None:
+            def on_done(counts: dict[str, int]) -> None:
                 self._refresh_datasets()
+                total = sum(counts.values())
+                labels = ", ".join(f"'{n}'" for n in counts)
                 self._status_bar.showMessage(
-                    f"Saved {count} asset(s) into dataset '{name}'.", 5000
+                    f"Saved {total} asset(s) into {labels}.", 5000
                 )
 
             self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
@@ -1361,12 +1459,10 @@ class MainWindow(QMainWindow):
         s = self._settings()
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("splitter/main", self._splitter.saveState())
-        s.setValue("splitter/left", self._left_splitter.saveState())
         s.setValue("table/header", self._table_view.save_header_state())
         s.setValue("tag_panel/header", self._tag_panel.save_header_state())
-        s.setValue("filter/sort_by", self._sort_combo.currentText())
-        s.setValue("filter/sort_desc", self._sort_desc_btn.isChecked())
-        s.setValue("filter/show_missing", self._show_missing_cb.isChecked())
+        s.setValue("worker/backfill_phash", self._backfill_cb.isChecked())
+        s.setValue("worker/batch_size", self._batch_size_spin.value())
 
     def _restore_settings(self) -> None:
         s = self._settings()
@@ -1374,20 +1470,14 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geom)
         if state := s.value("splitter/main"):
             self._splitter.restoreState(state)
-        if state := s.value("splitter/left"):
-            self._left_splitter.restoreState(state)
         if state := s.value("table/header"):
             self._table_view.restore_header_state(state)
         if state := s.value("tag_panel/header"):
             self._tag_panel.restore_header_state(state)
-        if sort_by := s.value("filter/sort_by"):
-            idx = self._sort_combo.findText(sort_by)
-            if idx >= 0:
-                self._sort_combo.setCurrentIndex(idx)
-        if (sort_desc := s.value("filter/sort_desc")) is not None:
-            self._sort_desc_btn.setChecked(sort_desc in (True, "true"))
-        if (show_missing := s.value("filter/show_missing")) is not None:
-            self._show_missing_cb.setChecked(show_missing in (True, "true"))
+        backfill = s.value("worker/backfill_phash", defaultValue=True, type=bool)
+        self._backfill_cb.setChecked(backfill)
+        batch = s.value("worker/batch_size", defaultValue=10, type=int)
+        self._batch_size_spin.setValue(batch)
 
     def closeEvent(self, event) -> None:
         self._save_settings()

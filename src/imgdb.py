@@ -7,7 +7,7 @@ argparse, stdout, or Tkinter. It returns data and raises typed exceptions.
 
 Design invariants:
     - One file on disk = one asset. rel_path is UNIQUE within a shard.
-    - asset_id is a stable UUID. current_hash is a mutable attribute that
+    - asset_id is a stable UUID. file_hash is a mutable attribute that
       changes when a file is edited in place.
     - Shards are self-contained. A shard file does not record its own label
       or its own absolute path; those come from the config at runtime.
@@ -41,6 +41,13 @@ try:
 except ImportError as e:
     raise ImportError(
         "imgdb requires the 'Pillow' package. Install with: pip install Pillow"
+    ) from e
+
+try:
+    import imagehash as _imagehash
+except ImportError as e:
+    raise ImportError(
+        "imgdb requires the 'imagehash' package. Install with: pip install imagehash"
     ) from e
 
 
@@ -106,7 +113,8 @@ class FileOperationError(ImgDBError):
 class Asset:
     asset_id: str
     rel_path: str
-    current_hash: str
+    file_hash: str
+    perceptual_hash: Optional[str]
     width: Optional[int]
     height: Optional[int]
     format: Optional[str]
@@ -135,23 +143,24 @@ class ScanSummary:
 
 SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS assets (
-    asset_id       TEXT PRIMARY KEY,
-    rel_path       TEXT NOT NULL UNIQUE,
-    current_hash   TEXT NOT NULL,
-    phash          INTEGER,
-    width          INTEGER,
-    height         INTEGER,
-    format         TEXT,
-    bytes          INTEGER,
-    mtime_ns       INTEGER,
-    last_seen      TIMESTAMP,
-    exists_flag    INTEGER DEFAULT 1,
-    tags_validated INTEGER NOT NULL DEFAULT 0,
-    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    asset_id         TEXT PRIMARY KEY,
+    rel_path         TEXT NOT NULL UNIQUE,
+    file_hash        TEXT NOT NULL,
+    perceptual_hash  TEXT,
+    width            INTEGER,
+    height           INTEGER,
+    format           TEXT,
+    bytes            INTEGER,
+    mtime_ns         INTEGER,
+    last_seen        TIMESTAMP,
+    exists_flag      INTEGER DEFAULT 1,
+    tags_validated   INTEGER NOT NULL DEFAULT 0,
+    has_mask         INTEGER NOT NULL DEFAULT 0,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_assets_hash  ON assets(current_hash);
-CREATE INDEX IF NOT EXISTS idx_assets_phash ON assets(phash);
+CREATE INDEX IF NOT EXISTS idx_assets_hash  ON assets(file_hash);
+CREATE INDEX IF NOT EXISTS idx_assets_phash ON assets(perceptual_hash);
 
 CREATE TABLE IF NOT EXISTS asset_hash_history (
     asset_id     TEXT NOT NULL REFERENCES assets(asset_id) ON DELETE CASCADE,
@@ -273,10 +282,21 @@ def connect(db_path: str | os.PathLike, read_only: bool = False) -> sqlite3.Conn
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Apply incremental column additions to existing shards."""
+    """Apply incremental column additions/renames to existing shards."""
+    asset_cols = {row[1] for row in conn.execute("PRAGMA table_info(assets)")}
+    # Renames (SQLite 3.35+, safe on Python 3.10+).
+    if "current_hash" in asset_cols and "file_hash" not in asset_cols:
+        conn.execute("ALTER TABLE assets RENAME COLUMN current_hash TO file_hash")
+    if "phash" in asset_cols and "perceptual_hash" not in asset_cols:
+        conn.execute("ALTER TABLE assets RENAME COLUMN phash TO perceptual_hash")
+    elif "perceptual_hash" not in asset_cols:
+        conn.execute("ALTER TABLE assets ADD COLUMN perceptual_hash TEXT")
+    # Refresh after renames.
     asset_cols = {row[1] for row in conn.execute("PRAGMA table_info(assets)")}
     if "tags_validated" not in asset_cols:
         conn.execute("ALTER TABLE assets ADD COLUMN tags_validated INTEGER NOT NULL DEFAULT 0")
+    if "has_mask" not in asset_cols:
+        conn.execute("ALTER TABLE assets ADD COLUMN has_mask INTEGER NOT NULL DEFAULT 0")
     caption_cols = {row[1] for row in conn.execute("PRAGMA table_info(captions)")}
     if "is_validated" not in caption_cols:
         conn.execute("ALTER TABLE captions ADD COLUMN is_validated INTEGER NOT NULL DEFAULT 0")
@@ -328,6 +348,37 @@ def hash_file(path: str | os.PathLike) -> str:
     return hasher.hexdigest()
 
 
+# Sentinel stored in perceptual_hash for assets that could not be hashed.
+# NULL means "not yet attempted"; PHASH_FAILED means "tried, but failed."
+# All queries that look for un-hashed assets filter on IS NULL, so PHASH_FAILED
+# is excluded automatically — those assets are never re-queued for backfill.
+PHASH_FAILED = ""
+
+
+def compute_perceptual_hash(path: str | os.PathLike) -> Optional[str]:
+    """
+    Return the imagehash pHash (hex string) of the image's pixel content.
+    Returns None if the file cannot be opened as an image.
+    Format, compression, and metadata are ignored — only pixel data matters.
+    """
+    try:
+        with Image.open(path) as img:
+            return str(_imagehash.phash(img))
+    except Exception:
+        return None
+
+
+def set_perceptual_hash(
+    conn: sqlite3.Connection, asset_id: str, phash: Optional[str]
+) -> None:
+    """Write the perceptual hash for an asset. Used by backfill and preview."""
+    with transaction(conn):
+        conn.execute(
+            "UPDATE assets SET perceptual_hash = ? WHERE asset_id = ?",
+            (phash, asset_id),
+        )
+
+
 def probe_image(path: str | os.PathLike) -> ProbeResult:
     """Extract dimensions, format, and size without loading pixels."""
     st = os.stat(path)
@@ -354,14 +405,15 @@ def thumbs_dir(root_abs_path: str) -> Path:
 # Asset lookups
 # ---------------------------------------------------------------------------
 
-_ASSET_COLS = "asset_id, rel_path, current_hash, width, height, format, bytes"
+_ASSET_COLS = "asset_id, rel_path, file_hash, perceptual_hash, width, height, format, bytes"
 
 
 def _row_to_asset(row: sqlite3.Row) -> Asset:
     return Asset(
         asset_id=row["asset_id"],
         rel_path=row["rel_path"],
-        current_hash=row["current_hash"],
+        file_hash=row["file_hash"],
+        perceptual_hash=row["perceptual_hash"],
         width=row["width"],
         height=row["height"],
         format=row["format"],
@@ -695,70 +747,85 @@ def _ingest_file(
     mtime_ns = st.st_mtime_ns
 
     existing = conn.execute(
-        "SELECT asset_id, current_hash, bytes, mtime_ns FROM assets WHERE rel_path = ?",
+        "SELECT asset_id, file_hash, bytes, mtime_ns, has_mask FROM assets WHERE rel_path = ?",
         (rel_path,),
     ).fetchone()
+
+    has_mask_on_disk = 1 if os.path.isfile(mask_path_for(abs_path)) else 0
 
     if (
         existing is not None
         and existing["bytes"] == size
         and existing["mtime_ns"] == mtime_ns
     ):
-        conn.execute(
-            "UPDATE assets SET last_seen = CURRENT_TIMESTAMP, exists_flag = 1 "
-            "WHERE asset_id = ?",
-            (existing["asset_id"],),
-        )
+        if existing["has_mask"] != has_mask_on_disk:
+            conn.execute(
+                "UPDATE assets SET last_seen = CURRENT_TIMESTAMP, exists_flag = 1,"
+                " has_mask = ? WHERE asset_id = ?",
+                (has_mask_on_disk, existing["asset_id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE assets SET last_seen = CURRENT_TIMESTAMP, exists_flag = 1 "
+                "WHERE asset_id = ?",
+                (existing["asset_id"],),
+            )
         return "unchanged", None
 
     content_hash = hash_file(abs_path)
     probe = probe_image(abs_path)
 
     if existing is not None:
-        if existing["current_hash"] == content_hash:
+        if existing["file_hash"] == content_hash:
             # Touched but content identical: refresh stat fields only.
             conn.execute(
                 """
                 UPDATE assets
-                   SET bytes = ?, mtime_ns = ?, last_seen = CURRENT_TIMESTAMP,
-                       exists_flag = 1
+                   SET bytes = ?, mtime_ns = ?, has_mask = ?,
+                       last_seen = CURRENT_TIMESTAMP, exists_flag = 1
                  WHERE asset_id = ?
                 """,
-                (size, mtime_ns, existing["asset_id"]),
+                (size, mtime_ns, has_mask_on_disk, existing["asset_id"]),
             )
             return "unchanged", None
 
         conn.execute(
             "INSERT OR IGNORE INTO asset_hash_history(asset_id, hash) VALUES (?, ?)",
-            (existing["asset_id"], existing["current_hash"]),
+            (existing["asset_id"], existing["file_hash"]),
         )
+        phash = compute_perceptual_hash(abs_path)
         conn.execute(
             """
             UPDATE assets
-               SET current_hash = ?, width = ?, height = ?, format = ?,
-                   bytes = ?, mtime_ns = ?,
+               SET file_hash = ?, perceptual_hash = ?,
+                   width = ?, height = ?, format = ?,
+                   bytes = ?, mtime_ns = ?, has_mask = ?,
                    last_seen = CURRENT_TIMESTAMP, exists_flag = 1,
                    updated_at = CURRENT_TIMESTAMP
              WHERE asset_id = ?
             """,
             (
-                content_hash, probe.width, probe.height, probe.format,
-                size, mtime_ns, existing["asset_id"],
+                content_hash, phash,
+                probe.width, probe.height, probe.format,
+                size, mtime_ns, has_mask_on_disk, existing["asset_id"],
             ),
         )
         return "edited", None
 
+    phash = compute_perceptual_hash(abs_path)
     asset_id = str(uuid.uuid4())
     conn.execute(
         """
         INSERT INTO assets(
-            asset_id, rel_path, current_hash, width, height, format, bytes,
-            mtime_ns, last_seen, exists_flag
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
+            asset_id, rel_path, file_hash, perceptual_hash,
+            width, height, format, bytes,
+            mtime_ns, last_seen, exists_flag, has_mask
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1, ?)
         """,
         (
-            asset_id, rel_path, content_hash,
+            asset_id, rel_path, content_hash, phash,
             probe.width, probe.height, probe.format, size, mtime_ns,
+            has_mask_on_disk,
         ),
     )
     return "new", asset_id
@@ -921,6 +988,20 @@ def set_caption_validated(
         conn.execute(
             "UPDATE captions SET is_validated = ? WHERE asset_id = ? AND kind = ?",
             (1 if validated else 0, asset_id, kind),
+        )
+
+
+def mask_path_for(abs_path: str | os.PathLike) -> str:
+    """Return the conventional path for an image's companion mask file."""
+    base, _ = os.path.splitext(str(abs_path))
+    return f"{base}_mask.png"
+
+
+def set_has_mask(conn: sqlite3.Connection, asset_id: str, has_mask: bool) -> None:
+    with transaction(conn):
+        conn.execute(
+            "UPDATE assets SET has_mask = ? WHERE asset_id = ?",
+            (1 if has_mask else 0, asset_id),
         )
 
 
@@ -1149,7 +1230,7 @@ def merge_assets(
 
         conn.execute(
             "INSERT OR IGNORE INTO asset_hash_history(asset_id, hash) VALUES (?, ?)",
-            (survivor_id, merged.current_hash),
+            (survivor_id, merged.file_hash),
         )
         conn.execute(
             """

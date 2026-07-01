@@ -919,8 +919,12 @@ class ConfirmDeleteDialog(QDialog):
 
 class AddToDatasetDialog(QDialog):
     """
-    Prompts for a dataset name. Shows existing datasets as a clickable list
-    for quick selection; the user can also type a new name to create one.
+    Multi-select dataset picker.
+
+    Existing datasets are shown as a checkable list; the user can check any
+    number of them.  A "New dataset" field at the top lets them create one
+    at the same time.  Accepts when at least one dataset is checked or a new
+    name is typed.
     """
 
     def __init__(
@@ -928,60 +932,93 @@ class AddToDatasetDialog(QDialog):
         existing_names: list[str],
         parent: Optional[QWidget] = None,
     ) -> None:
-        super().__init__()
+        super().__init__(parent)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setWindowTitle("Add to Dataset")
         self.setMinimumWidth(320)
 
-        self._name_edit = QLineEdit()
-        self._name_edit.setPlaceholderText("Type a name…")
-
-        self._error_label = QLabel()
-        self._error_label.setStyleSheet("color: red;")
-        self._error_label.hide()
-
         layout = QVBoxLayout(self)
 
+        # New dataset entry
+        new_row = QHBoxLayout()
+        new_lbl = QLabel("New:")
+        new_lbl.setFixedWidth(36)
+        self._new_edit = QLineEdit()
+        self._new_edit.setPlaceholderText("Create a new dataset…")
+        new_row.addWidget(new_lbl)
+        new_row.addWidget(self._new_edit)
+        layout.addLayout(new_row)
+
+        # Existing datasets as checkboxes
+        self._list: Optional[QListWidget] = None
         if existing_names:
-            layout.addWidget(QLabel("Select an existing dataset or type a new name to create one:"))
-            existing_list = QListWidget()
-            existing_list.setMaximumHeight(140)
+            layout.addWidget(QLabel("Add to existing:"))
+            self._list = QListWidget()
+            self._list.setMaximumHeight(220)
             for name in existing_names:
-                existing_list.addItem(QListWidgetItem(name))
-            existing_list.itemClicked.connect(
-                lambda item: self._name_edit.setText(item.text())
-            )
-            layout.addWidget(existing_list)
-            layout.addWidget(QLabel("Dataset name:"))
+                item = QListWidgetItem(name)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                self._list.addItem(item)
+            self._list.itemChanged.connect(self._update_ok_state)
+            layout.addWidget(self._list)
         else:
-            hint = QLabel("No datasets yet. Enter a name to create one:")
+            hint = QLabel("No datasets yet — enter a name above to create one.")
             hint.setStyleSheet("color: gray; font-size: 11px;")
             layout.addWidget(hint)
-            layout.addWidget(QLabel("Dataset name:"))
 
-        layout.addWidget(self._name_edit)
+        self._error_label = QLabel()
+        self._error_label.setStyleSheet("color: red; font-size: 11px;")
+        self._error_label.hide()
         layout.addWidget(self._error_label)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Add / Create")
+        self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self._ok_btn.setText("Add / Create")
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self._name_edit.setFocus()
+        self._new_edit.textChanged.connect(self._update_ok_state)
+        self._update_ok_state()
+        self._new_edit.setFocus()
+
+    def _checked_existing(self) -> list[str]:
+        if self._list is None:
+            return []
+        return [
+            self._list.item(i).text()
+            for i in range(self._list.count())
+            if self._list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _update_ok_state(self) -> None:
+        has_new = bool(self._new_edit.text().strip())
+        self._ok_btn.setEnabled(has_new or bool(self._checked_existing()))
 
     def _validate_and_accept(self) -> None:
-        if not self._name_edit.text().strip():
-            self._error_label.setText("Name cannot be empty.")
+        if not self.dataset_names():
+            self._error_label.setText("Check at least one dataset or enter a new name.")
             self._error_label.show()
             return
         self._error_label.hide()
         self.accept()
 
+    def dataset_names(self) -> list[str]:
+        """All datasets to add to: new name (if any) + all checked existing names."""
+        result = []
+        new_name = self._new_edit.text().strip()
+        if new_name:
+            result.append(new_name)
+        result.extend(self._checked_existing())
+        return result
+
     def dataset_name(self) -> str:
-        return self._name_edit.text().strip()
+        """Single-name accessor for callers that only need one (e.g. save-as-query)."""
+        names = self.dataset_names()
+        return names[0] if names else ""
 
 
 # ---------------------------------------------------------------------------

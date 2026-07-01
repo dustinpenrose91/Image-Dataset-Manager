@@ -110,6 +110,10 @@ class QtDBBridge:
         # garbage-collected before their signals fire.
         self._inflight: set = set()
 
+    @property
+    def is_running(self) -> bool:
+        return self._worker.is_running
+
     def root_abs_path(self, label: str) -> Optional[str]:
         """
         Return the absolute path for a root label, or None if the federation

@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Optional
 
 import imgdb
+from filter_model import FilterRule, SortRule, build_filter_conditions, build_sort_clause
 
 DEFAULT_CONFIG_PATH = "./imgdb.conf"
 CONFIG_SECTION = "roots"
@@ -640,11 +641,8 @@ def remove_tags_by_name(
 
 def list_tags_for_filtered_assets(
     fed: Federation,
-    checked_labels: Optional[Iterable[str]] = None,
-    where_clause: Optional[str] = None,
-    show_missing: bool = False,
-    dataset_name: Optional[str] = None,
-    tag_filter: Optional[list[str]] = None,
+    checked_labels: Optional[list[str]],
+    filter_rules: list[FilterRule],
 ) -> list[tuple[str, str, int]]:
     """
     Return (tag_name, type_name, count) for every tag used by assets that
@@ -653,40 +651,11 @@ def list_tags_for_filtered_assets(
     if fed.read_conn is None:
         return []
 
-    conditions: list[str] = []
-    params: list = []
-
-    if checked_labels is not None:
-        labels = list(checked_labels)
-        if not labels:
-            return []
-        ph = ",".join("?" * len(labels))
-        conditions.append(f"all_assets._root IN ({ph})")
-        params.extend(labels)
-
-    if not show_missing:
-        conditions.append("all_assets.exists_flag = 1")
-
-    if dataset_name is not None:
-        conditions.append(
-            "all_assets.asset_id IN"
-            " (SELECT asset_id FROM all_dataset_assets WHERE dataset_name = ?)"
-        )
-        params.append(dataset_name)
-
-    for tf in (tag_filter or []):
-        tf = tf.strip()
-        if tf:
-            conditions.append(
-                "all_assets.asset_id IN ("
-                "SELECT tat.asset_id FROM all_asset_tags tat"
-                " JOIN all_tags tfl ON tat.tag_id = tfl.tag_id"
-                " WHERE tfl.name = ?)"
-            )
-            params.append(tf)
-
-    if where_clause and where_clause.strip():
-        conditions.append(f"({where_clause})")
+    conditions, params = build_filter_conditions(
+        filter_rules, checked_labels, alias="all_assets"
+    )
+    if conditions == ["1=0"]:
+        return []
 
     sql = (
         "SELECT t.name AS tag_name, tt.name AS type_name,"
@@ -819,11 +788,12 @@ def add_tag_to_filtered_assets(
     fed: Federation,
     tag_name: str,
     type_name: str,
-    filter_kwargs: dict,
+    checked_labels: Optional[list[str]],
+    filter_rules: list[FilterRule],
 ) -> None:
     """Add a tag to every asset matching the current filter."""
     by_shard: dict[str, list[str]] = {}
-    for asset in list_filtered_assets(fed, **filter_kwargs):
+    for asset in list_filtered_assets(fed, checked_labels, filter_rules, []):
         by_shard.setdefault(asset.root, []).append(asset.asset_id)
     for label, ids in by_shard.items():
         conn = fed.shards[label].conn
@@ -840,11 +810,12 @@ def remove_tag_from_filtered_assets(
     fed: Federation,
     tag_name: str,
     type_name: str,
-    filter_kwargs: dict,
+    checked_labels: Optional[list[str]],
+    filter_rules: list[FilterRule],
 ) -> None:
     """Remove a specific (name, type) tag from every asset matching the current filter."""
     by_shard: dict[str, list[str]] = {}
-    for asset in list_filtered_assets(fed, **filter_kwargs):
+    for asset in list_filtered_assets(fed, checked_labels, filter_rules, []):
         by_shard.setdefault(asset.root, []).append(asset.asset_id)
     for label, ids in by_shard.items():
         if not ids:
@@ -917,18 +888,6 @@ def merge_assets(
 
 # Columns that the editing-tab list view is allowed to sort by. Restricted
 # to a whitelist because the sort key is interpolated into SQL — we cannot
-# parameterize identifiers.
-SORTABLE_COLUMNS: frozenset[str] = frozenset({
-    "rel_path", "bytes", "width", "height", "format",
-    "current_hash", "created_at", "updated_at", "_root",
-})
-
-# TODO(display-name): introduce a per-root `display_name` field in the
-# config alongside `label`, and expose a synthetic `shard` column on the
-# union views that returns the display_name. Hide `_root` from end users
-# at that point. This is a prerequisite for tag/caption filtering in the
-# UI's SQL filter (see related TODO in the UI design notes).
-
 
 @dataclass(frozen=True)
 class AssetRow:
@@ -941,6 +900,7 @@ class AssetRow:
     height: Optional[int]
     format: Optional[str]
     exists_flag: int
+    perceptual_hash: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -953,86 +913,35 @@ class DatasetInfo:
 
 def list_filtered_assets(
     fed: Federation,
-    checked_labels: Optional[Iterable[str]] = None,
-    where_clause: Optional[str] = None,
-    sort_by: str = "rel_path",
-    sort_desc: bool = False,
-    show_missing: bool = False,
-    dataset_name: Optional[str] = None,
-    tag_filter: Optional[list[str]] = None,
+    checked_labels: Optional[list[str]],
+    filter_rules: list[FilterRule],
+    sort_rules: list[SortRule],
     limit: Optional[int] = None,
     offset: int = 0,
 ) -> Iterator[AssetRow]:
     """
-    Stream asset rows from the federation, restricted to the checked
-    shards and an optional user-supplied WHERE clause.
+    Stream asset rows from the federation filtered by checked roots and
+    FilterRules. Pagination via limit/offset.
 
-    The WHERE clause is wrapped in parentheses and ANDed with the shard
-    filter and the existence filter. It can reference any column on the
-    `assets` table plus `_root`. Tag and caption filtering are not yet
-    supported here (pinned TODO).
-
-    A SQL syntax error in the user clause raises sqlite3.OperationalError;
-    the caller is expected to surface this and leave the previous filter
-    in place.
-
-    `limit` and `offset` map directly to SQL LIMIT/OFFSET — use them for
-    pagination so only the needed rows are transferred. Omit both to stream
-    the full result set via fetchmany (important for million-asset sets).
+    A SQL syntax error in a custom-SQL FilterRule raises sqlite3.OperationalError;
+    callers should surface the error and keep the previous filter.
     """
     if fed.read_conn is None:
         return
 
-    if sort_by not in SORTABLE_COLUMNS:
-        raise ValueError(
-            f"sort_by must be one of {sorted(SORTABLE_COLUMNS)}; got {sort_by!r}"
-        )
+    conditions, params = build_filter_conditions(filter_rules, checked_labels, alias="a")
+    if conditions == ["1=0"]:
+        return
 
+    order = build_sort_clause(sort_rules)
     sql_parts = [
-        "SELECT asset_id, _root, rel_path, bytes, width, height, format, exists_flag",
-        "FROM all_assets",
+        "SELECT a.asset_id, a._root, a.rel_path, a.bytes, a.width, a.height,"
+        "       a.format, a.exists_flag, a.perceptual_hash",
+        "FROM all_assets a",
     ]
-    conditions: list[str] = []
-    params: list = []
-
-    if checked_labels is not None:
-        labels = list(checked_labels)
-        if not labels:
-            return  # nothing checked => empty result
-        placeholders = ",".join("?" * len(labels))
-        conditions.append(f"_root IN ({placeholders})")
-        params.extend(labels)
-
-    if not show_missing:
-        conditions.append("exists_flag = 1")
-
-    if dataset_name is not None:
-        conditions.append(
-            "asset_id IN (SELECT asset_id FROM all_dataset_assets WHERE dataset_name = ?)"
-        )
-        params.append(dataset_name)
-
-    for tf in (tag_filter or []):
-        tf = tf.strip()
-        if tf:
-            conditions.append(
-                "asset_id IN ("
-                "SELECT at.asset_id FROM all_asset_tags at"
-                " JOIN all_tags t ON at.tag_id = t.tag_id"
-                " WHERE t.name = ?)"
-            )
-            params.append(tf)
-
-    if where_clause and where_clause.strip():
-        conditions.append(f"({where_clause})")
-
     if conditions:
         sql_parts.append("WHERE " + " AND ".join(conditions))
-
-    direction = "DESC" if sort_desc else "ASC"
-    # asset_id tiebreaker so paginated/streamed results are deterministic
-    # across calls.
-    sql_parts.append(f"ORDER BY {sort_by} {direction}, asset_id ASC")
+    sql_parts.append(f"ORDER BY {order}")
 
     if limit is not None:
         sql_parts.append("LIMIT ?")
@@ -1041,12 +950,10 @@ def list_filtered_assets(
             sql_parts.append("OFFSET ?")
             params.append(offset)
     elif offset:
-        # SQLite requires LIMIT when OFFSET is used; -1 means no limit.
         sql_parts.append("LIMIT -1 OFFSET ?")
         params.append(offset)
 
-    sql = "\n".join(sql_parts)
-    cursor = fed.read_conn.execute(sql, params)
+    cursor = fed.read_conn.execute("\n".join(sql_parts), params)
     while True:
         rows = cursor.fetchmany(1000)
         if not rows:
@@ -1061,64 +968,121 @@ def list_filtered_assets(
                 height=r["height"],
                 format=r["format"],
                 exists_flag=r["exists_flag"],
+                perceptual_hash=r["perceptual_hash"],
             )
 
 
 def count_filtered_assets(
     fed: Federation,
-    checked_labels: Optional[Iterable[str]] = None,
-    where_clause: Optional[str] = None,
-    show_missing: bool = False,
-    dataset_name: Optional[str] = None,
-    tag_filter: Optional[list[str]] = None,
+    checked_labels: Optional[list[str]],
+    filter_rules: list[FilterRule],
 ) -> int:
-    """
-    Cheap row-count for the same filter list_filtered_assets uses. The UI
-    needs this to size virtualized list models without iterating the
-    whole result.
-    """
+    """Cheap row-count for the same filter list_filtered_assets uses."""
     if fed.read_conn is None:
         return 0
 
-    sql_parts = ["SELECT COUNT(*) FROM all_assets"]
-    conditions: list[str] = []
-    params: list = []
+    conditions, params = build_filter_conditions(filter_rules, checked_labels, alias="a")
+    if conditions == ["1=0"]:
+        return 0
 
-    if checked_labels is not None:
-        labels = list(checked_labels)
-        if not labels:
-            return 0
-        placeholders = ",".join("?" * len(labels))
-        conditions.append(f"_root IN ({placeholders})")
-        params.extend(labels)
-
-    if not show_missing:
-        conditions.append("exists_flag = 1")
-
-    if dataset_name is not None:
-        conditions.append(
-            "asset_id IN (SELECT asset_id FROM all_dataset_assets WHERE dataset_name = ?)"
-        )
-        params.append(dataset_name)
-
-    for tf in (tag_filter or []):
-        tf = tf.strip()
-        if tf:
-            conditions.append(
-                "asset_id IN ("
-                "SELECT at.asset_id FROM all_asset_tags at"
-                " JOIN all_tags t ON at.tag_id = t.tag_id"
-                " WHERE t.name = ?)"
-            )
-            params.append(tf)
-
-    if where_clause and where_clause.strip():
-        conditions.append(f"({where_clause})")
-
+    sql = "SELECT COUNT(*) FROM all_assets a"
     if conditions:
-        sql_parts.append("WHERE " + " AND ".join(conditions))
+        sql += " WHERE " + " AND ".join(conditions)
+    return fed.read_conn.execute(sql, params).fetchone()[0]
 
-    return fed.read_conn.execute("\n".join(sql_parts), params).fetchone()[0]
+
+def repair_missing_has_mask(fed: Federation, limit: int = 500) -> int:
+    """
+    Find existing assets where has_mask=0 but a mask file is present on disk,
+    and update the DB to has_mask=1.  Returns the number of records repaired.
+
+    This is a one-shot repair for assets that were masked before the has_mask
+    column was introduced.
+    """
+    if fed.read_conn is None:
+        return 0
+    rows = fed.read_conn.execute(
+        "SELECT asset_id, _root, rel_path FROM all_assets"
+        " WHERE has_mask = 0 AND exists_flag = 1 LIMIT ?",
+        (limit,),
+    ).fetchall()
+    repaired = 0
+    for r in rows:
+        shard = fed.shards.get(r["_root"])
+        if shard is None:
+            continue
+        abs_path = os.path.join(shard.abs_path, r["rel_path"])
+        if os.path.isfile(imgdb.mask_path_for(abs_path)):
+            imgdb.set_has_mask(shard.conn, r["asset_id"], True)
+            repaired += 1
+    return repaired
+
+
+def count_assets_missing_perceptual_hash(fed: Federation) -> int:
+    """Total existing assets with no perceptual hash."""
+    if fed.read_conn is None:
+        return 0
+    return fed.read_conn.execute(
+        "SELECT COUNT(*) FROM all_assets"
+        " WHERE perceptual_hash IS NULL AND exists_flag = 1"
+    ).fetchone()[0]
+
+
+def list_assets_missing_perceptual_hash(
+    fed: Federation,
+    limit: int,
+    priority_labels: Optional[list[str]] = None,
+    priority_rules: Optional[list[FilterRule]] = None,
+) -> list[tuple[str, str, str]]:
+    """
+    Return up to `limit` (asset_id, rel_path, shard_label) tuples for
+    existing assets whose perceptual_hash is NULL.
+
+    When priority_labels/priority_rules are given, assets matching the
+    current filter are returned first; remaining slots are filled from all
+    assets so the backfill eventually completes even when the filter is
+    narrow.
+    """
+    if fed.read_conn is None:
+        return []
+
+    result: list[tuple[str, str, str]] = []
+
+    if priority_labels is not None or priority_rules:
+        conds, params = build_filter_conditions(
+            priority_rules or [], priority_labels, alias="a"
+        )
+        if conds != ["1=0"]:
+            conds += ["a.perceptual_hash IS NULL", "a.exists_flag = 1"]
+            sql = (
+                "SELECT a.asset_id, a._root, a.rel_path FROM all_assets a"
+                " WHERE " + " AND ".join(conds) + " LIMIT ?"
+            )
+            params.append(limit)
+            for r in fed.read_conn.execute(sql, params).fetchall():
+                result.append((r["asset_id"], r["rel_path"], r["_root"]))
+
+    remaining = limit - len(result)
+    if remaining > 0:
+        seen_ids = {r[0] for r in result}
+        if seen_ids:
+            placeholders = ",".join("?" * len(seen_ids))
+            sql = (
+                "SELECT asset_id, _root, rel_path FROM all_assets"
+                f" WHERE perceptual_hash IS NULL AND exists_flag = 1"
+                f" AND asset_id NOT IN ({placeholders}) LIMIT ?"
+            )
+            params = [*seen_ids, remaining]
+        else:
+            sql = (
+                "SELECT asset_id, _root, rel_path FROM all_assets"
+                " WHERE perceptual_hash IS NULL AND exists_flag = 1 LIMIT ?"
+            )
+            params = [remaining]
+        for r in fed.read_conn.execute(sql, params).fetchall():
+            result.append((r["asset_id"], r["rel_path"], r["_root"]))
+
+    return result
 
 
 def run_user_query(
@@ -1626,21 +1590,16 @@ def bulk_import_caption_tags(
     caption_kind: Optional[str],
     tag_lookup: dict[str, tuple[str, list[str]]],
     resolution: dict[str, str],
-    checked_labels: Optional[Iterable[str]] = None,
-    where_clause: Optional[str] = None,
-    show_missing: bool = False,
-    dataset_name: Optional[str] = None,
-    tag_filter: Optional[list[str]] = None,
+    checked_labels: Optional[list[str]] = None,
+    filter_rules: Optional[list[FilterRule]] = None,
 ) -> int:
     """Import matched tags for every asset in scope. Returns total assignments added."""
     total = 0
     for asset in list_filtered_assets(
         fed,
-        checked_labels=checked_labels,
-        where_clause=where_clause,
-        show_missing=show_missing,
-        dataset_name=dataset_name,
-        tag_filter=tag_filter,
+        checked_labels,
+        filter_rules or [],
+        [],
     ):
         shard = fed.shards.get(asset.root)
         if shard is None:

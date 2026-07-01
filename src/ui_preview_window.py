@@ -499,8 +499,10 @@ class PreviewWindow(QWidget):
         visibility_changed  [Signal(bool)]
     """
 
-    visibility_changed = Signal(bool)
-    image_modified     = Signal(str)    # abs_path — emitted after any destructive save
+    visibility_changed    = Signal(bool)
+    image_modified        = Signal(str)        # abs_path — emitted after any destructive save
+    mask_saved            = Signal(str, bool)  # abs_path, has_mask
+    perceptual_hash_ready = Signal(str, str)   # abs_path, phash_hex
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent, Qt.WindowType.Window)
@@ -510,6 +512,7 @@ class PreviewWindow(QWidget):
 
         self._abs_path: Optional[str] = None
         self._rel_path: str = ""
+        self._needs_phash: bool = False
 
         # Mode buttons
         self._view_btn = QPushButton("View")
@@ -587,9 +590,15 @@ class PreviewWindow(QWidget):
 
     # -- public API ---------------------------------------------------------
 
-    def set_image(self, abs_path: Optional[str], rel_path: str = "") -> None:
+    def set_image(
+        self,
+        abs_path: Optional[str],
+        rel_path: str = "",
+        needs_phash: bool = False,
+    ) -> None:
         self._abs_path = abs_path
         self._rel_path = rel_path
+        self._needs_phash = needs_phash
         if abs_path is None:
             self._canvas.set_source(None)
             self.setWindowTitle("Preview")
@@ -600,6 +609,12 @@ class PreviewWindow(QWidget):
             self.setWindowTitle(f"Preview — {rel_path} (cannot load)")
             return
         self._canvas.set_source(img)
+        if needs_phash:
+            import imgdb as _imgdb
+            phash = _imgdb.compute_perceptual_hash(abs_path)
+            if phash is not None:
+                self.perceptual_hash_ready.emit(abs_path, phash)
+                self._needs_phash = False
         self.setWindowTitle(
             f"Preview — {rel_path or abs_path}  [{img.width()} × {img.height()}]"
         )
@@ -646,6 +661,8 @@ class PreviewWindow(QWidget):
                 self.setWindowTitle(
                     self.windowTitle().split(" [mask")[0] + " [mask cleared]"
                 )
+                if self._abs_path:
+                    self.mask_saved.emit(self._abs_path, False)
             else:
                 QMessageBox.information(self, "Mask", "No mask painted yet.")
             return
@@ -657,6 +674,8 @@ class PreviewWindow(QWidget):
         self.setWindowTitle(
             self.windowTitle().split(" [mask")[0] + " [mask saved]"
         )
+        if self._abs_path:
+            self.mask_saved.emit(self._abs_path, True)
 
     def _load_mask(self) -> None:
         default = _mask_path_for(self._abs_path) if self._abs_path else ""

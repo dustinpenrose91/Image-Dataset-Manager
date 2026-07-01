@@ -205,6 +205,10 @@ class DBWorker:
         self._thread = None
         self._fed = None
 
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
     def set_federation(self, new_fed: "federation.Federation") -> None:
         """
         Replace the active federation. Must only be called from within a

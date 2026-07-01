@@ -2,17 +2,12 @@
 TagManagementPanel — right-pane tab for browsing and bulk-editing tags.
 
 Displays all tags used by assets matching the current filter, with columns
-for tag name, category, and usage count.  Seven action buttons operate on
-the selected tag row:
+for tag name, category, and usage count.  Buttons operate on the selected row:
 
   Row 1 (global): Replace Tag, Delete Tag, Change Tag Type
   Row 2 (add):    Add to Selection, Add to Filtered
   Row 3 (remove): Remove from Selection, Remove from Filtered
-  Row 4:          Add to Filters
-
-Below the buttons is a Tag Filters section: a live list of AND-combined tag
-filters applied to the asset view, with per-item remove buttons and
-Add/Clear controls.
+  Row 4:          Add as Filter (adds a tag filter rule to the Browse panel)
 """
 from __future__ import annotations
 
@@ -20,8 +15,8 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QInputDialog,
-    QLabel, QLineEdit, QPushButton, QScrollArea, QTableWidget,
+    QAbstractItemView, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -35,12 +30,11 @@ class TagManagementPanel(QWidget):
     add_to_filtered_requested       = Signal(str, str)  # name, type_name
     remove_from_selection_requested = Signal(str, str)  # name, type_name
     remove_from_filtered_requested  = Signal(str, str)  # name, type_name
-    tag_filters_changed             = Signal(list)      # list[str]
+    add_as_filter_requested         = Signal(str, str)  # name, type_name
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._all_tags: list[tuple[str, str, int]] = []
-        self._active_filters: list[str] = []
 
         # Search field
         self._search_edit = QLineEdit()
@@ -82,8 +76,8 @@ class TagManagementPanel(QWidget):
         self._rm_sel_btn      = QPushButton("Remove from Selection")
         self._rm_filtered_btn = QPushButton("Remove from Filtered")
 
-        # Row 4 — tag filters
-        self._add_filter_btn = QPushButton("Add to Filters")
+        # Row 4 — add as filter in browse panel
+        self._add_filter_btn = QPushButton("Add as Filter")
 
         self._action_buttons = [
             self._replace_btn, self._delete_btn, self._change_type_btn,
@@ -108,7 +102,8 @@ class TagManagementPanel(QWidget):
             lambda: self._emit(self.remove_from_selection_requested))
         self._rm_filtered_btn.clicked.connect(
             lambda: self._emit(self.remove_from_filtered_requested))
-        self._add_filter_btn.clicked.connect(self._on_add_selected_to_filters)
+        self._add_filter_btn.clicked.connect(
+            lambda: self._emit(self.add_as_filter_requested))
 
         row1 = QHBoxLayout()
         row1.setSpacing(4)
@@ -131,36 +126,6 @@ class TagManagementPanel(QWidget):
         row4.addWidget(self._add_filter_btn)
         row4.addStretch()
 
-        # ── Tag Filters section ──────────────────────────────────────────
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
-
-        filters_header = QLabel("<b>TAG FILTERS</b>")
-        filters_header.setStyleSheet("font-size: 11px;")
-
-        self._filter_rows_widget = QWidget()
-        self._filter_rows_layout = QVBoxLayout(self._filter_rows_widget)
-        self._filter_rows_layout.setContentsMargins(0, 0, 0, 0)
-        self._filter_rows_layout.setSpacing(2)
-
-        filter_scroll = QScrollArea()
-        filter_scroll.setWidgetResizable(True)
-        filter_scroll.setWidget(self._filter_rows_widget)
-        filter_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        filter_scroll.setMaximumHeight(120)
-
-        add_filter_btn = QPushButton("Add tag filter…")
-        add_filter_btn.clicked.connect(self._on_add_filter_typed)
-        clear_filters_btn = QPushButton("Clear all")
-        clear_filters_btn.clicked.connect(self._on_clear_filters)
-
-        filter_btns = QHBoxLayout()
-        filter_btns.setSpacing(4)
-        filter_btns.addWidget(add_filter_btn)
-        filter_btns.addWidget(clear_filters_btn)
-        filter_btns.addStretch()
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
@@ -171,10 +136,6 @@ class TagManagementPanel(QWidget):
         layout.addLayout(row2)
         layout.addLayout(row3)
         layout.addLayout(row4)
-        layout.addWidget(sep)
-        layout.addWidget(filters_header)
-        layout.addWidget(filter_scroll)
-        layout.addLayout(filter_btns)
 
     # -- public API -----------------------------------------------------------
 
@@ -182,9 +143,6 @@ class TagManagementPanel(QWidget):
         """Populate the table. tags: [(name, type_name, count)]"""
         self._all_tags = tags
         self._apply_search_filter()
-
-    def active_filters(self) -> list[str]:
-        return list(self._active_filters)
 
     def _apply_search_filter(self) -> None:
         query = self._search_edit.text().strip().lower()
@@ -244,58 +202,6 @@ class TagManagementPanel(QWidget):
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-
-    # -- tag filter list ------------------------------------------------------
-
-    def _add_filter(self, name: str) -> None:
-        if name and name not in self._active_filters:
-            self._active_filters.append(name)
-            self._rebuild_filter_rows()
-            self.tag_filters_changed.emit(list(self._active_filters))
-
-    def _remove_filter(self, name: str) -> None:
-        if name in self._active_filters:
-            self._active_filters.remove(name)
-            self._rebuild_filter_rows()
-            self.tag_filters_changed.emit(list(self._active_filters))
-
-    def _rebuild_filter_rows(self) -> None:
-        while self._filter_rows_layout.count():
-            item = self._filter_rows_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        for name in self._active_filters:
-            row = QWidget()
-            rl = QHBoxLayout(row)
-            rl.setContentsMargins(0, 0, 0, 0)
-            rl.setSpacing(4)
-            lbl = QLabel(name)
-            lbl.setStyleSheet("font-size: 12px;")
-            rm_btn = QPushButton("−")
-            rm_btn.setFixedWidth(22)
-            rm_btn.setStyleSheet("color: #c0392b; font-weight: bold;")
-            rm_btn.setToolTip("Remove from filters")
-            rm_btn.clicked.connect(lambda _=False, n=name: self._remove_filter(n))
-            rl.addWidget(lbl, stretch=1)
-            rl.addWidget(rm_btn)
-            self._filter_rows_layout.addWidget(row)
-
-    def _on_add_selected_to_filters(self) -> None:
-        tag = self.selected_tag()
-        if tag:
-            self._add_filter(tag[0])
-
-    def _on_add_filter_typed(self) -> None:
-        name, ok = QInputDialog.getText(self, "Add Tag Filter", "Tag name:")
-        name = name.strip()
-        if ok and name:
-            self._add_filter(name)
-
-    def _on_clear_filters(self) -> None:
-        if self._active_filters:
-            self._active_filters.clear()
-            self._rebuild_filter_rows()
-            self.tag_filters_changed.emit([])
 
     # -- private --------------------------------------------------------------
 

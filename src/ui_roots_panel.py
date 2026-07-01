@@ -149,8 +149,12 @@ class RootEntry(QWidget):
         if not scanning:
             self._status_label.setStyleSheet("font-size: 11px; color: gray;")
 
+    def set_scan_progress(self, done: int, total: int) -> None:
+        self._status_label.setStyleSheet("font-size: 11px; color: #2980b9;")
+        self._status_label.setText(f"Scanning… ({done:,} of {total:,})")
+
     def update_scan_event(self, kind: str, rel_path: str) -> None:
-        """Called from the worker thread via a queued signal."""
+        """Called from the worker thread via a queued signal (missing-file phase only)."""
         self._status_label.setStyleSheet("font-size: 11px; color: #2980b9;")
         short = rel_path if len(rel_path) <= 42 else "…" + rel_path[-41:]
         self._status_label.setText(f"↳ {short}")
@@ -311,9 +315,12 @@ class RootsPanel(QWidget):
         lbl = label
 
         def on_event(kind: str, rel_path: str) -> None:
-            e = self._entries.get(lbl)
-            if e:
-                e.scan_event.emit(kind, rel_path)
+            # Only forward missing-file events (finish phase); batch progress
+            # is shown via set_scan_progress in on_batch_done instead.
+            if kind == "missing":
+                e = self._entries.get(lbl)
+                if e:
+                    e.scan_event.emit(kind, rel_path)
 
         def on_error(exc: BaseException) -> None:
             e = self._entries.get(lbl)
@@ -342,6 +349,9 @@ class RootsPanel(QWidget):
         def submit_batch(session) -> None:
             def on_batch_done(result) -> None:
                 sess, done = result
+                e = self._entries.get(lbl)
+                if e:
+                    e.set_scan_progress(sess.offset, len(sess.all_paths))
                 if done or (cancel is not None and cancel.is_set()):
                     submit_finish(sess)
                 else:

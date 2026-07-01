@@ -10,7 +10,7 @@ filename:
     <root>/imgdb_thumbs/<aa>/<asset_id>-<hash12>.webp
 
 where `aa` is the first two hex characters of `asset_id` and `hash12`
-is the first 12 hex characters of the asset's `current_hash`. The hash
+is the first 12 hex characters of the asset's `file_hash`. The hash
 in the filename means an in-place edit naturally produces a new path,
 so the new thumbnail does not overwrite the old one and stale
 thumbnails are simply orphaned. A later sweep can collect them.
@@ -73,7 +73,7 @@ THUMB_FORMAT = "WEBP"
 THUMB_EXT = ".webp"
 THUMB_QUALITY = 85
 THUMB_QUALITY_LQ = 70          # lower quality for fast LQ generation
-HASH_PREFIX_LEN = 12           # how many hex chars of current_hash to embed
+HASH_PREFIX_LEN = 12           # how many hex chars of file_hash to embed
 
 BACKGROUND_JOB_SLEEP = 0.05   # seconds to yield between background thumbnail jobs
 
@@ -87,19 +87,19 @@ PRIORITY_BACKGROUND = 2   # bulk generation for off-screen rows
 # Path helpers
 # ---------------------------------------------------------------------------
 
-def thumb_path(root_abs_path: str, asset_id: str, current_hash: str) -> str:
+def thumb_path(root_abs_path: str, asset_id: str, file_hash: str) -> str:
     """LQ (fast) thumbnail path. Pure function."""
     base = imgdb.thumbs_dir(root_abs_path)
     fan = asset_id[:2]
-    name = f"{asset_id}-{current_hash[:HASH_PREFIX_LEN]}{THUMB_EXT}"
+    name = f"{asset_id}-{file_hash[:HASH_PREFIX_LEN]}{THUMB_EXT}"
     return str(base / fan / name)
 
 
-def thumb_path_hq(root_abs_path: str, asset_id: str, current_hash: str) -> str:
+def thumb_path_hq(root_abs_path: str, asset_id: str, file_hash: str) -> str:
     """HQ (LANCZOS, 256px) thumbnail path. Pure function."""
     base = imgdb.thumbs_dir(root_abs_path)
     fan = asset_id[:2]
-    name = f"{asset_id}-{current_hash[:HASH_PREFIX_LEN]}-hq{THUMB_EXT}"
+    name = f"{asset_id}-{file_hash[:HASH_PREFIX_LEN]}-hq{THUMB_EXT}"
     return str(base / fan / name)
 
 

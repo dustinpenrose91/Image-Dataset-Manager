@@ -171,8 +171,8 @@ class ScanTests(unittest.TestCase):
         abs_path = self._put("a.png", color=(100, 0, 0))
         scan_root(self.conn, self.root)
         old_hash = self.conn.execute(
-            "SELECT current_hash FROM assets WHERE rel_path = 'a.png'"
-        ).fetchone()["current_hash"]
+            "SELECT file_hash FROM assets WHERE rel_path = 'a.png'"
+        ).fetchone()["file_hash"]
         Image.new("RGB", (10, 10), (200, 50, 50)).save(abs_path)
         scan_root(self.conn, self.root)
         history = [r["hash"] for r in self.conn.execute(
@@ -522,7 +522,7 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(row["content"], "exclusive to merged")
 
     def test_merge_moves_hash_to_survivor_history(self):
-        merged_hash = get_asset(self.conn, self.aid_b).current_hash
+        merged_hash = get_asset(self.conn, self.aid_b).file_hash
         merge_assets(self.conn, self.aid_a, self.aid_b)
         history = {r["hash"] for r in self.conn.execute(
             "SELECT hash FROM asset_hash_history WHERE asset_id = ?",

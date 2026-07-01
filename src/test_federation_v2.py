@@ -15,6 +15,10 @@ from PIL import Image
 
 import federation
 import imgdb
+from filter_model import FilterRule, SortRule
+
+_EXISTS = FilterRule("exists_flag", "is_true", "")
+_SORT_PATH = SortRule("rel_path", False)
 
 
 def _make_root(parent: str, name: str, n: int) -> str:
@@ -94,56 +98,61 @@ class FilteredListTests(unittest.TestCase):
         shutil.rmtree(self.tmp)
 
     def test_default_lists_all_visible_assets(self) -> None:
-        rows = list(federation.list_filtered_assets(self.fed))
+        rows = list(federation.list_filtered_assets(self.fed, None, [_EXISTS], [_SORT_PATH]))
         self.assertEqual(len(rows), 7)
-        # Sorted by rel_path ascending by default.
+        # Sorted by rel_path ascending.
         rel_paths = [r.rel_path for r in rows]
         self.assertEqual(rel_paths, sorted(rel_paths))
 
     def test_count_matches_list(self) -> None:
-        n = federation.count_filtered_assets(self.fed)
-        rows = list(federation.list_filtered_assets(self.fed))
+        n = federation.count_filtered_assets(self.fed, None, [_EXISTS])
+        rows = list(federation.list_filtered_assets(self.fed, None, [_EXISTS], []))
         self.assertEqual(n, len(rows))
 
     def test_filter_by_shard(self) -> None:
-        rows = list(federation.list_filtered_assets(self.fed, checked_labels=["alpha"]))
+        rows = list(federation.list_filtered_assets(self.fed, ["alpha"], [_EXISTS], []))
         self.assertEqual(len(rows), 4)
         self.assertTrue(all(r.root == "alpha" for r in rows))
 
     def test_no_shards_checked_returns_empty(self) -> None:
-        rows = list(federation.list_filtered_assets(self.fed, checked_labels=[]))
+        rows = list(federation.list_filtered_assets(self.fed, [], [_EXISTS], []))
         self.assertEqual(rows, [])
-        self.assertEqual(federation.count_filtered_assets(self.fed, checked_labels=[]), 0)
+        self.assertEqual(federation.count_filtered_assets(self.fed, [], [_EXISTS]), 0)
 
     def test_where_clause_applied(self) -> None:
         # Width was set to 10+i so beta_2 has width 12, etc.
-        rows = list(federation.list_filtered_assets(
-            self.fed, where_clause="width >= 12"))
+        rules = [_EXISTS, FilterRule("sql", "sql", "a.width >= 12")]
+        rows = list(federation.list_filtered_assets(self.fed, None, rules, []))
         self.assertTrue(len(rows) >= 1)
         self.assertTrue(all(r.width >= 12 for r in rows))
 
     def test_where_clause_combines_with_shard_filter(self) -> None:
-        rows = list(federation.list_filtered_assets(
-            self.fed, checked_labels=["alpha"], where_clause="width >= 11"))
+        rules = [_EXISTS, FilterRule("sql", "sql", "a.width >= 11")]
+        rows = list(federation.list_filtered_assets(self.fed, ["alpha"], rules, []))
         self.assertTrue(all(r.root == "alpha" and r.width >= 11 for r in rows))
 
     def test_sort_descending(self) -> None:
-        rows = list(federation.list_filtered_assets(self.fed, sort_desc=True))
+        rows = list(federation.list_filtered_assets(
+            self.fed, None, [_EXISTS], [SortRule("rel_path", True)]))
         rel_paths = [r.rel_path for r in rows]
         self.assertEqual(rel_paths, sorted(rel_paths, reverse=True))
 
     def test_sort_by_bytes(self) -> None:
-        rows = list(federation.list_filtered_assets(self.fed, sort_by="bytes"))
+        rows = list(federation.list_filtered_assets(
+            self.fed, None, [_EXISTS], [SortRule("bytes", False)]))
         sizes = [r.bytes for r in rows]
         self.assertEqual(sizes, sorted(sizes))
 
-    def test_sort_by_invalid_column_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            list(federation.list_filtered_assets(self.fed, sort_by="rel_path; DROP TABLE assets"))
+    def test_sort_by_invalid_field_ignored(self) -> None:
+        # Unknown field IDs in SortRule are silently skipped; query still runs.
+        rows = list(federation.list_filtered_assets(
+            self.fed, None, [_EXISTS], [SortRule("not_a_real_field", False)]))
+        self.assertIsInstance(rows, list)
 
     def test_syntax_error_propagates(self) -> None:
         with self.assertRaises(sqlite3.OperationalError):
-            list(federation.list_filtered_assets(self.fed, where_clause="not a valid clause"))
+            list(federation.list_filtered_assets(
+                self.fed, None, [FilterRule("sql", "sql", "not a valid clause")], []))
 
     def test_show_missing_excludes_by_default(self) -> None:
         # Mark one asset as missing manually.
@@ -156,13 +165,13 @@ class FilteredListTests(unittest.TestCase):
         # Re-open so the read conn sees it.
         self.fed.close()
         self.fed = federation.open_federation(self.cfg)
-        visible = list(federation.list_filtered_assets(self.fed))
-        with_missing = list(federation.list_filtered_assets(self.fed, show_missing=True))
-        self.assertEqual(len(with_missing), len(visible) + 1)
+        visible = list(federation.list_filtered_assets(self.fed, None, [_EXISTS], []))
+        all_including_missing = list(federation.list_filtered_assets(self.fed, None, [], []))
+        self.assertEqual(len(all_including_missing), len(visible) + 1)
 
     def test_streaming_does_not_materialize(self) -> None:
         # Smoke test: the function returns a generator, not a list.
-        result = federation.list_filtered_assets(self.fed)
+        result = federation.list_filtered_assets(self.fed, None, [_EXISTS], [])
         self.assertFalse(isinstance(result, list))
         # First iteration produces a row.
         first = next(iter(result))

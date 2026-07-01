@@ -30,13 +30,14 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QHeaderView, QLabel,
+    QAbstractItemView, QApplication, QHeaderView, QLabel, QMenu,
     QSizePolicy, QTableView, QWidget,
 )
 
 import federation
 import imgdb
 import imgdb_thumbs
+from filter_model import FilterRule, SortRule
 from imgdb_thumbs_qt import QtThumbnailBridge
 from imgdb_worker_qt import QtDBBridge
 
@@ -49,10 +50,16 @@ COL_ROOT   = 2
 COL_DIMS   = 3
 COL_FORMAT = 4
 COL_SIZE   = 5
-COL_ID     = 6
-NUM_COLS   = 7
+COL_PHASH  = 6
+COL_ID     = 7
+NUM_COLS   = 8
 
-_HEADERS = ["", "Path", "Root", "Dimensions", "Format", "Size", "Asset ID"]
+_HEADERS = ["", "Path", "Root", "Dimensions", "Format", "Size", "Perceptual Hash", "Asset ID"]
+
+# Columns that can be toggled via the header context menu (excludes thumbnail).
+_TOGGLEABLE_COLS = (COL_PATH, COL_ROOT, COL_DIMS, COL_FORMAT, COL_SIZE, COL_PHASH, COL_ID)
+# Columns hidden by default (shown only when user opts in).
+_DEFAULT_HIDDEN = (COL_PHASH,)
 
 _SCROLL_DEBOUNCE_MS = 150   # ms after scroll stops before bumping priorities
 
@@ -112,33 +119,21 @@ class AssetTableModel(QAbstractTableModel):
 
         # Current filter state.
         self._checked_labels: Optional[list[str]] = None
-        self._where: Optional[str] = None
-        self._sort_by: str = "rel_path"
-        self._sort_desc: bool = False
-        self._show_missing: bool = False
-        self._dataset_name: Optional[str] = None
-        self._tag_filter: Optional[list[str]] = None
+        self._filter_rules: list[FilterRule] = []
+        self._sort_rules: list[SortRule] = []
 
     # -- public API ---------------------------------------------------------
 
     def refresh(
         self,
         checked_labels: Optional[list[str]] = None,
-        where: Optional[str] = None,
-        sort_by: str = "rel_path",
-        sort_desc: bool = False,
-        show_missing: bool = False,
-        dataset_name: Optional[str] = None,
-        tag_filter: Optional[list[str]] = None,
+        filter_rules: Optional[list[FilterRule]] = None,
+        sort_rules: Optional[list[SortRule]] = None,
     ) -> None:
         """Re-query with the given filter. Clears all cached rows."""
         self._checked_labels = checked_labels
-        self._where = where
-        self._sort_by = sort_by
-        self._sort_desc = sort_desc
-        self._show_missing = show_missing
-        self._dataset_name = dataset_name
-        self._tag_filter = tag_filter
+        self._filter_rules = filter_rules or []
+        self._sort_rules = sort_rules or []
         self._rows.clear()
         self._pages_inflight.clear()
         self._thumb_requested.clear()
@@ -209,6 +204,7 @@ class AssetTableModel(QAbstractTableModel):
             if col == COL_DIMS:   return _fmt_dims(asset.width, asset.height)
             if col == COL_FORMAT: return asset.format or ""
             if col == COL_SIZE:   return _fmt_size(asset.bytes)
+            if col == COL_PHASH:  return asset.perceptual_hash or ""
             if col == COL_ID:     return asset.asset_id
 
         if role == Qt.ItemDataRole.DecorationRole and col == COL_THUMB:
@@ -233,10 +229,7 @@ class AssetTableModel(QAbstractTableModel):
 
     def _fetch_count(self) -> None:
         cl = self._checked_labels
-        wh = self._where
-        sm = self._show_missing
-        dn = self._dataset_name
-        tf = self._tag_filter
+        fr = list(self._filter_rules)
 
         def on_result(count: int) -> None:
             self.beginResetModel()
@@ -248,7 +241,7 @@ class AssetTableModel(QAbstractTableModel):
                 self._fetch_page(0)
 
         def on_error(exc: BaseException) -> None:
-            # SQL error in WHERE clause — reset to empty.
+            # SQL error in custom-SQL FilterRule — reset to empty.
             self.beginResetModel()
             self._total = 0
             self._rows = []
@@ -256,11 +249,8 @@ class AssetTableModel(QAbstractTableModel):
 
         self._bridge.submit(
             federation.count_filtered_assets,
-            checked_labels=cl,
-            where_clause=wh,
-            show_missing=sm,
-            dataset_name=dn,
-            tag_filter=tf,
+            cl,
+            fr,
             on_result=on_result,
             on_error=on_error,
         )
@@ -279,12 +269,8 @@ class AssetTableModel(QAbstractTableModel):
 
         offset = page * PAGE_SIZE
         cl = self._checked_labels
-        wh = self._where
-        sb = self._sort_by
-        sd = self._sort_desc
-        sm = self._show_missing
-        dn = self._dataset_name
-        tf = self._tag_filter
+        fr = list(self._filter_rules)
+        sr = list(self._sort_rules)
 
         def on_result(rows: list[federation.AssetRow]) -> None:
             self._pages_inflight.discard(page)
@@ -292,9 +278,8 @@ class AssetTableModel(QAbstractTableModel):
                 idx = offset + i
                 if idx < len(self._rows):
                     self._rows[idx] = r
-                    # Track visibility for newly arrived rows.
                     if r is not None:
-                        self._visible_ids.discard(r.asset_id)  # will re-add below if visible
+                        self._visible_ids.discard(r.asset_id)
             if rows:
                 top = self.index(offset, 0)
                 bot = self.index(offset + len(rows) - 1, NUM_COLS - 1)
@@ -306,14 +291,7 @@ class AssetTableModel(QAbstractTableModel):
 
         def fetch_fn(fed: federation.Federation) -> list[federation.AssetRow]:
             return list(federation.list_filtered_assets(
-                fed,
-                checked_labels=cl,
-                where_clause=wh,
-                sort_by=sb,
-                sort_desc=sd,
-                show_missing=sm,
-                dataset_name=dn,
-                tag_filter=tf,
+                fed, cl, fr, sr,
                 limit=PAGE_SIZE,
                 offset=offset,
             ))
@@ -369,7 +347,7 @@ class AssetTableModel(QAbstractTableModel):
             try:
                 a = imgdb.get_asset(shard.conn, aid)
                 src = os.path.join(shard.abs_path, a.rel_path)
-                dest = imgdb_thumbs.thumb_path(shard.abs_path, aid, a.current_hash)
+                dest = imgdb_thumbs.thumb_path(shard.abs_path, aid, a.file_hash)
                 return src, dest
             except Exception:
                 return None
@@ -442,9 +420,16 @@ class AssetTableView(QTableView):
     Emits selection_changed(rows: list[AssetRow]) when the selection changes.
     Sends debounced viewport-change notifications to the model so it can
     prioritise thumbnail generation for visible rows.
+
+    Context menu:
+      Right-clicking any data cell shows copy actions for the clicked cell,
+      then emits context_menu_requested so the parent can append further
+      actions (with its own separator).  Pass `object` type to avoid Qt
+      metatype registration for QMenu.
     """
 
-    selection_changed = Signal(list)   # list[federation.AssetRow]
+    selection_changed      = Signal(list)           # list[federation.AssetRow]
+    context_menu_requested = Signal(object, list)   # (QMenu, list[AssetRow])
 
     def __init__(self, model: AssetTableModel, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -460,12 +445,17 @@ class AssetTableView(QTableView):
         hh.setSectionResizeMode(COL_THUMB, QHeaderView.ResizeMode.Fixed)
         hh.resizeSection(COL_THUMB, THUMB_COL_SIZE + 8)
         _interactive_defaults = {
-            COL_PATH: 300, COL_ROOT: 90, COL_DIMS: 90, COL_FORMAT: 60, COL_SIZE: 70,
+            COL_PATH: 300, COL_ROOT: 90, COL_DIMS: 90, COL_FORMAT: 60,
+            COL_SIZE: 70, COL_PHASH: 140,
         }
         for col, width in _interactive_defaults.items():
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
             hh.resizeSection(col, width)
         hh.setSectionResizeMode(COL_ID, QHeaderView.ResizeMode.Stretch)
+        for col in _DEFAULT_HIDDEN:
+            hh.hideSection(col)
+        hh.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        hh.customContextMenuRequested.connect(self._show_column_menu)
         self.selectionModel().selectionChanged.connect(self._on_selection_changed)
         model.page_loaded.connect(self._on_page_loaded)
 
@@ -482,12 +472,75 @@ class AssetTableView(QTableView):
 
     def restore_header_state(self, state: bytes) -> None:
         hh = self.horizontalHeader()
+        # Apply defaults first; restoreState will override them if the saved
+        # state is compatible (same column count).
+        for col in _DEFAULT_HIDDEN:
+            hh.hideSection(col)
         hh.restoreState(state)
         # restoreState overwrites resize modes — re-apply ours.
         hh.setSectionResizeMode(COL_THUMB, QHeaderView.ResizeMode.Fixed)
-        for col in (COL_PATH, COL_ROOT, COL_DIMS, COL_FORMAT, COL_SIZE):
+        for col in (COL_PATH, COL_ROOT, COL_DIMS, COL_FORMAT, COL_SIZE, COL_PHASH):
             hh.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(COL_ID, QHeaderView.ResizeMode.Stretch)
+
+    def contextMenuEvent(self, event) -> None:
+        idx = self.indexAt(event.pos())
+        if not idx.isValid():
+            return
+
+        row = idx.row()
+        col = idx.column()
+        asset = self._model.row_data(row)
+
+        # Determine scope for parent-level actions.
+        # If the right-clicked row is already selected, use the full selection
+        # so bulk actions feel natural.  Otherwise, scope to just this row so
+        # right-clicking a different row doesn't accidentally act on the old set.
+        selected_rows = sorted({i.row() for i in self.selectedIndexes()})
+        if row in selected_rows:
+            scope_assets = [self._model.row_data(r) for r in selected_rows]
+        else:
+            scope_assets = [asset]
+        scope_assets = [a for a in scope_assets if a is not None]
+
+        menu = QMenu(self)
+
+        # -- Copy actions for the clicked cell --------------------------------
+        if col != COL_THUMB and asset is not None:
+            cell_text = str(self._model.data(idx, Qt.ItemDataRole.DisplayRole) or "")
+            if cell_text:
+                col_name = _HEADERS[col]
+                act = menu.addAction(f"Copy {col_name}")
+                act.triggered.connect(
+                    lambda _=False, t=cell_text: QApplication.clipboard().setText(t)
+                )
+
+        # Asset ID is universally useful; always offer it unless it's the clicked column.
+        if asset is not None and col != COL_ID:
+            aid = asset.asset_id
+            act = menu.addAction("Copy Asset ID")
+            act.triggered.connect(
+                lambda _=False, t=aid: QApplication.clipboard().setText(t)
+            )
+
+        # -- Parent-supplied actions (merge, delete, etc.) --------------------
+        # The parent adds a separator then its own actions when it handles this.
+        self.context_menu_requested.emit(menu, scope_assets)
+
+        if not menu.isEmpty():
+            menu.exec(event.globalPos())
+
+    def _show_column_menu(self, pos) -> None:
+        hh = self.horizontalHeader()
+        menu = QMenu(self)
+        for col in _TOGGLEABLE_COLS:
+            action = menu.addAction(_HEADERS[col])
+            action.setCheckable(True)
+            action.setChecked(not hh.isSectionHidden(col))
+            action.toggled.connect(
+                lambda checked, c=col: hh.showSection(c) if checked else hh.hideSection(c)
+            )
+        menu.exec(hh.mapToGlobal(pos))
 
     def _on_page_loaded(self, first: int, last: int) -> None:
         selected = sorted({idx.row() for idx in self.selectedIndexes()})

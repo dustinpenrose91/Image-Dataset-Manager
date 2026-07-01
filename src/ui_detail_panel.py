@@ -501,7 +501,7 @@ class _SingleDetail(QWidget):
             if shard is None:
                 return None
             try:
-                return imgdb.get_asset(shard.conn, asset.asset_id).current_hash
+                return imgdb.get_asset(shard.conn, asset.asset_id).file_hash
             except Exception:
                 return None
 
