@@ -412,6 +412,31 @@ class FederationWriteTests(unittest.TestCase):
         with self.assertRaises(CrossShardOperationError):
             merge_assets(self.fed, self._alpha_id(), self._beta_id())
 
+    def _seed_ambiguous(self) -> str:
+        """Create a tag 'sunset' under two categories and caption an asset with it.
+        Returns the captioned asset_id."""
+        ids = self._alpha_ids()
+        add_tags(self.fed, ids[0], ["sunset"], type_name="Lighting")
+        add_tags(self.fed, ids[1], ["sunset"], type_name="Style")
+        set_caption(self.fed, ids[2], "short", "a golden sunset over water")
+        return ids[2]
+
+    def test_prescan_ambiguous_returns_name_no_filter(self):
+        captioned = self._seed_ambiguous()
+        lookup = federation.build_tag_lookup(self.fed)
+        result = federation.prescan_ambiguous_matches(self.fed, "short", lookup)
+        names = [canon for canon, _types in result]
+        self.assertIn("sunset", names)
+
+    def test_prescan_ambiguous_returns_name_with_filter(self):
+        self._seed_ambiguous()
+        lookup = federation.build_tag_lookup(self.fed)
+        result = federation.prescan_ambiguous_matches(
+            self.fed, "short", lookup, checked_labels=["alpha"], filter_rules=[]
+        )
+        names = [canon for canon, _types in result]
+        self.assertIn("sunset", names)
+
 
 class FederationFTSTests(unittest.TestCase):
 

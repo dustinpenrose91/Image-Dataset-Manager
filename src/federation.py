@@ -1553,11 +1553,8 @@ def prescan_ambiguous_matches(
     fed: Federation,
     caption_kind: Optional[str],
     tag_lookup: dict[str, tuple[str, list[str]]],
-    checked_labels: Optional[Iterable[str]] = None,
-    where_clause: Optional[str] = None,
-    show_missing: bool = False,
-    dataset_name: Optional[str] = None,
-    tag_filter: Optional[list[str]] = None,
+    checked_labels: Optional[list[str]] = None,
+    filter_rules: Optional[list[FilterRule]] = None,
 ) -> list[tuple[str, list[str]]]:
     """
     Scan all in-scope captions and return the unique set of ambiguous tag
@@ -1565,14 +1562,7 @@ def prescan_ambiguous_matches(
     "Ask per tag" imports so the user resolves each name exactly once.
     """
     seen: dict[str, tuple[str, list[str]]] = {}
-    for asset in list_filtered_assets(
-        fed,
-        checked_labels=checked_labels,
-        where_clause=where_clause,
-        show_missing=show_missing,
-        dataset_name=dataset_name,
-        tag_filter=tag_filter,
-    ):
+    for asset in list_filtered_assets(fed, checked_labels, filter_rules or [], []):
         shard = fed.shards.get(asset.root)
         if shard is None:
             continue
