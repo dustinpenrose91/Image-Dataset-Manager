@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 
@@ -557,6 +558,98 @@ class MergeTests(unittest.TestCase):
         merge_assets(self.conn, self.aid_a, self.aid_b)
         with self.assertRaises(AssetNotFoundError):
             get_asset(self.conn, self.aid_b)
+
+
+class AtomicRollbackTests(unittest.TestCase):
+    """A failure inside the DB transaction must restore the staged file and
+    leave the DB row untouched (invariant #5)."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.conn = init_shard(self.root)
+        _img(os.path.join(self.root, "a.png"))
+        _, ids = scan_root(self.conn, self.root)
+        self.aid = ids[0]
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.root)
+
+    def _staging_leftovers(self) -> list[str]:
+        out = []
+        for dirpath, _dirs, files in os.walk(self.root):
+            out += [f for f in files if imgdb.STAGING_MARKER in f]
+        return out
+
+    def _failing_conn(self, verb: str):
+        """A proxy over self.conn that raises when a statement starts with verb.
+        (sqlite3.Connection.execute is a read-only C attribute, so it can't be
+        patched in place; wrapping is the clean way to inject a mid-transaction
+        failure.)"""
+        real = self.conn
+
+        class _Proxy:
+            def execute(self, sql, *a, **k):
+                if sql.strip().upper().startswith(verb):
+                    raise sqlite3.OperationalError("injected failure")
+                return real.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        return _Proxy()
+
+    def test_rename_rolls_back_on_db_failure(self):
+        old_abs = os.path.join(self.root, "a.png")
+        conn = self._failing_conn("UPDATE")
+        with self.assertRaises(sqlite3.OperationalError):
+            rename_asset(conn, self.root, self.aid, "sub/b.png")
+        self.assertTrue(os.path.exists(old_abs))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "sub", "b.png")))
+        self.assertEqual(get_asset(self.conn, self.aid).rel_path, "a.png")
+        self.assertEqual(self._staging_leftovers(), [])
+
+    def test_delete_rolls_back_on_db_failure(self):
+        abs_path = os.path.join(self.root, "a.png")
+        conn = self._failing_conn("DELETE")
+        with self.assertRaises(sqlite3.OperationalError):
+            delete_asset(conn, self.root, self.aid)
+        self.assertTrue(os.path.exists(abs_path))
+        self.assertEqual(get_asset(self.conn, self.aid).rel_path, "a.png")
+        self.assertEqual(self._staging_leftovers(), [])
+
+
+class IncrementalScanTests(unittest.TestCase):
+    """scan_root_init → scan_root_batch (×N) → scan_root_finish."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.conn = init_shard(self.root)
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.root)
+
+    def test_incremental_flow_ingests_all_and_marks_missing(self):
+        for i in range(5):
+            _img(os.path.join(self.root, f"f{i}.png"), color=(i * 10, 0, 0))
+        session = imgdb.scan_root_init(self.conn, self.root)
+        guard = 0
+        while not imgdb.scan_root_batch(self.conn, session):
+            guard += 1
+            self.assertLess(guard, 100, "batch loop did not terminate")
+        summary, new_ids = imgdb.scan_root_finish(self.conn, session)
+        self.assertEqual(summary.new, 5)
+        self.assertEqual(len(new_ids), 5)
+
+        # Second incremental pass after removing one file marks it missing.
+        os.remove(os.path.join(self.root, "f0.png"))
+        session = imgdb.scan_root_init(self.conn, self.root)
+        while not imgdb.scan_root_batch(self.conn, session):
+            pass
+        summary, _ = imgdb.scan_root_finish(self.conn, session)
+        self.assertEqual(summary.missing, 1)
+        self.assertEqual(summary.new, 0)
 
 
 if __name__ == "__main__":

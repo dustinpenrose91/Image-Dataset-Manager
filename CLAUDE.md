@@ -54,8 +54,18 @@ imgdb_worker_qt.py / imgdb_thumbs_qt.py
                   Qt adapters only. Marshal callbacks from worker threads to
                   Qt signals on the main thread. No business logic.
 
-imgdb_ui.py       Main window. Imports from all layers above but adds no
-                  business logic.
+ui_controller.py  AppController — widget-free QObject owning DB-write
+                  submissions through the bridge. Exposes intent methods
+                  (add_tag, save_caption, rename_asset, …) and emits change
+                  signals (error, tag_suggestions_stale, tags_changed,
+                  assets_changed, datasets_changed). No widget imports.
+
+ui_flows.py       Multi-step UI flows that interleave worker jobs with dialogs
+                  (CaptionImportFlow). State on the instance, one method per step.
+
+imgdb_ui.py       Main window. Constructs widgets, wires panel signals →
+                  controller/flow intents and controller signals → refresh
+                  slots, and keeps refresh policy. No SQL, minimal logic.
 
 ui_*.py           Individual UI panels and dialogs (asset table, detail panel,
                   roots panel, filter panel, query tab, dialogs, preview window).
@@ -88,6 +98,10 @@ ui_*.py           Individual UI panels and dialogs (asset table, detail panel,
 **Logging:** worker modules acquire `logging.getLogger(__name__)` and log (never silently swallow) failed jobs and raising `on_result`/`on_error` callbacks, while keeping the worker loop alive. Only the entry point (`imgdb_ui.main`) configures a handler; library modules never add handlers.
 
 **UI layering — no SQL in UI:** UI files contain no SQL strings. All data access goes through `imgdb`/`federation` accessors (e.g. `federation.find_asset_by_abs_path`, `imgdb.get_captions_for_asset`). Verify: `grep -rn 'execute(' src/ui_*.py src/imgdb_ui.py` returns nothing.
+
+**Controller / refresh policy:** mutations go through `AppController` intents; refresh is driven by *which* signal the intent emits, not by per-handler `on_done` closures. `tag_suggestions_stale` → debounced suggestion rescan only (single tag edits); `tags_changed` → full tag refresh (management ops); `assets_changed(preserve_scroll)` → `_apply_filter[_preserving_scroll]`; `datasets_changed` → dataset list. `MainWindow` connects these once in `_connect_signals`. A few bespoke handlers (delete row-reselection, merge file removal, fetch-then-dialog dataset adds, bulk import) still orchestrate directly in `MainWindow`.
+
+**Method naming (UI):** `refresh_*` = re-fetch from DB and update widgets; `load_*` = populate widgets from already-fetched data; `on_*`/`_on_*` = signal handlers.
 
 **Write→read ordering contract:** detail-panel refresh correctness relies on direct (synchronous) signal connections: a mutation handler submits its write job to the FIFO `DBWorker` queue *before* the subsequent reload job is submitted (`ui_detail_panel.py`), so the reload always observes the write. Do not make these connections queued/async.
 

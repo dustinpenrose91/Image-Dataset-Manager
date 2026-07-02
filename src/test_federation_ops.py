@@ -428,6 +428,26 @@ class FederationWriteTests(unittest.TestCase):
         names = [canon for canon, _types in result]
         self.assertIn("sunset", names)
 
+    def test_phash_failed_sentinel_excluded_from_missing(self):
+        ids = self._alpha_ids()
+        conn = self.fed.shards["alpha"].conn
+        # scan_root already computed phashes; reset the alpha assets to the two
+        # states a backfill must distinguish: NULL (not attempted) vs the
+        # PHASH_FAILED "" sentinel (attempted, unprocessable → never re-queue).
+        with imgdb.transaction(conn):
+            conn.execute("UPDATE assets SET perceptual_hash = NULL")
+        imgdb.set_perceptual_hash(conn, ids[1], imgdb.PHASH_FAILED)
+
+        # The two NULL alpha assets are missing; the sentinel one is not, and the
+        # beta assets keep their computed hashes.
+        self.assertEqual(federation.count_assets_missing_perceptual_hash(self.fed), 2)
+        listed_ids = {
+            aid for aid, _rel, _lbl
+            in federation.list_assets_missing_perceptual_hash(self.fed, 100)
+        }
+        self.assertEqual(listed_ids, {ids[0], ids[2]})
+        self.assertNotIn(ids[1], listed_ids)
+
     def test_find_asset_by_abs_path_locates_asset(self):
         aid = self._alpha_id()
         rel = imgdb.get_asset(self.fed.shards["alpha"].conn, aid).rel_path
