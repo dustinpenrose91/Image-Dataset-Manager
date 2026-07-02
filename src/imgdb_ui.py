@@ -62,6 +62,12 @@ class MainWindow(QMainWindow):
         self._fed: Optional[federation.Federation] = None
         self._worker: Optional[DBWorker] = None
         self._bridge: Optional[QtDBBridge] = None
+        # Dedicated thread for CPU-bound image decode (perceptual-hash backfill),
+        # kept off the DB worker so page fetches / counts / detail loads stay
+        # responsive during a backfill. Holds no federation (factory returns None);
+        # jobs only read files off disk, never touch a SQLite connection.
+        self._compute_worker: Optional[DBWorker] = None
+        self._compute_bridge: Optional[QtDBBridge] = None
         self._tag_suggestions: list = []
         self._tag_types: list[str] = ["General"]
         self._selected_assets: list[federation.AssetRow] = []
@@ -83,6 +89,14 @@ class MainWindow(QMainWindow):
         self._poll_timer.timeout.connect(self._update_status)
         self._poll_timer.start()
 
+        # Coalesce tag-suggestion rescans: each add/remove would otherwise fire
+        # list_all_tags_with_counts (a full scan of every shard's tags). Bursts
+        # of edits collapse into one rescan ~1s after the last edit.
+        self._tag_suggest_debounce = QTimer(self)
+        self._tag_suggest_debounce.setSingleShot(True)
+        self._tag_suggest_debounce.setInterval(1000)
+        self._tag_suggest_debounce.timeout.connect(self._refresh_tag_suggestions)
+
     # -----------------------------------------------------------------------
     # Workers
     # -----------------------------------------------------------------------
@@ -100,6 +114,11 @@ class MainWindow(QMainWindow):
             on_warning=self._on_shard_warning,
         )
         self._bridge = QtDBBridge(self._worker)
+
+        # Compute worker: same worker/bridge machinery, but no federation.
+        self._compute_worker = DBWorker()
+        self._compute_worker.start(lambda: None)
+        self._compute_bridge = QtDBBridge(self._compute_worker)
 
     def _on_shard_warning(self, msg: str) -> None:
         # May fire before _build_ui() has created the status bar (e.g. during
@@ -552,13 +571,21 @@ class MainWindow(QMainWindow):
         def op(fed: federation.Federation) -> None:
             federation.add_tags(fed, asset_id, [tag_name], type_name=type_name)
 
-        self._bridge.submit(op, on_result=lambda _: self._refresh_tag_suggestions(), on_error=self._show_error)
+        self._bridge.submit(
+            op,
+            on_result=lambda _: self._tag_suggest_debounce.start(),
+            on_error=self._show_error,
+        )
 
     def _remove_tag(self, asset_id: str, tag_id: str) -> None:
         def op(fed: federation.Federation) -> None:
             federation.remove_tags(fed, asset_id, [tag_id])
 
-        self._bridge.submit(op, on_result=lambda _: self._refresh_tag_suggestions(), on_error=self._show_error)
+        self._bridge.submit(
+            op,
+            on_result=lambda _: self._tag_suggest_debounce.start(),
+            on_error=self._show_error,
+        )
 
     def _save_caption(self, asset_id: str, kind: str, content: str) -> None:
         def op(fed: federation.Federation) -> None:
@@ -651,51 +678,89 @@ class MainWindow(QMainWindow):
         self._bridge.submit(count_op, on_result=on_count, on_error=self._show_error)
 
     def _run_phash_batch(self) -> None:
-        """Process one batch of perceptual hashes; reschedules itself until done."""
+        """
+        Process one batch of perceptual hashes across three thread hops so image
+        decoding never blocks the DB worker:
+          1. DB worker  — fetch (asset_id, label, abs_path) for missing assets.
+          2. compute worker — decode + DCT each file (CPU-bound, no SQLite).
+          3. DB worker  — persist the computed hashes.
+        Reschedules itself from hop 3 until the backlog drains.
+        """
         batch_size = self._batch_size_spin.value()
         # Capture filter state on the main thread before handing off to worker.
         priority_labels = self._roots_panel.checked_labels()
         priority_rules = self._filter_panel.current_filter_rules()
 
-        def op(fed: federation.Federation) -> tuple[int, bool]:
+        def fetch(fed: federation.Federation) -> list[tuple[str, str, str]]:
             missing = federation.list_assets_missing_perceptual_hash(
                 fed, batch_size,
                 priority_labels=priority_labels,
                 priority_rules=priority_rules,
             )
+            items = []
             for asset_id, rel_path, label in missing:
                 shard = fed.shards.get(label)
                 if shard is None:
                     continue
-                abs_path = os.path.join(shard.abs_path, rel_path)
+                items.append((asset_id, label, os.path.join(shard.abs_path, rel_path)))
+            return items
+
+        self._bridge.submit(fetch, on_result=self._phash_compute_batch, on_error=self._show_error)
+
+    def _phash_compute_batch(self, items: list[tuple[str, str, str]]) -> None:
+        if not items:
+            self._finish_phash_backfill()
+            return
+        complete = len(items) < self._batch_size_spin.value()
+
+        def compute(_fed) -> list[tuple[str, str, str]]:
+            results = []
+            for asset_id, label, abs_path in items:
                 phash = imgdb.compute_perceptual_hash(abs_path)
-                # Write PHASH_FAILED sentinel (not NULL) when hashing fails so
-                # the file is excluded from future backfill batches. NULL means
-                # "not yet attempted" and would re-queue the same file forever.
-                imgdb.set_perceptual_hash(
-                    shard.conn, asset_id, phash if phash is not None else imgdb.PHASH_FAILED
+                # PHASH_FAILED sentinel (not NULL) when hashing fails, so the file
+                # is excluded from future batches. NULL means "not yet attempted".
+                results.append(
+                    (asset_id, label, phash if phash is not None else imgdb.PHASH_FAILED)
                 )
-            return len(missing), len(missing) < batch_size
+            return results
 
-        def on_result(result: tuple[int, bool]) -> None:
-            n, complete = result
-            self._backfill_done = getattr(self, "_backfill_done", 0) + n
-            done = self._backfill_done
-            grand = getattr(self, "_backfill_total", done)
-            if not complete and self._bridge.is_running:
-                self._status_bar.showMessage(
-                    f"Computing perceptual hashes… ({done:,} of {grand:,})"
-                )
-                self._run_phash_batch()
-            else:
-                self._backfill_done = 0
-                self._backfill_total = 0
-                if done > 0:
-                    self._status_bar.showMessage(
-                        f"Perceptual hash backfill complete ({done:,} computed)", 5000
-                    )
+        def on_computed(results: list[tuple[str, str, str]]) -> None:
+            self._phash_write_batch(results, complete)
 
-        self._bridge.submit(op, on_result=on_result, on_error=self._show_error)
+        self._compute_bridge.submit(compute, on_result=on_computed, on_error=self._show_error)
+
+    def _phash_write_batch(self, results: list[tuple[str, str, str]], complete: bool) -> None:
+        def write(fed: federation.Federation) -> tuple[int, bool]:
+            for asset_id, label, phash in results:
+                shard = fed.shards.get(label)
+                if shard is None:
+                    continue
+                imgdb.set_perceptual_hash(shard.conn, asset_id, phash)
+            return len(results), complete
+
+        self._bridge.submit(write, on_result=self._on_phash_batch_written, on_error=self._show_error)
+
+    def _on_phash_batch_written(self, result: tuple[int, bool]) -> None:
+        n, complete = result
+        self._backfill_done = getattr(self, "_backfill_done", 0) + n
+        done = self._backfill_done
+        grand = getattr(self, "_backfill_total", done)
+        if not complete and self._bridge.is_running:
+            self._status_bar.showMessage(
+                f"Computing perceptual hashes… ({done:,} of {grand:,})"
+            )
+            self._run_phash_batch()
+        else:
+            self._finish_phash_backfill()
+
+    def _finish_phash_backfill(self) -> None:
+        done = getattr(self, "_backfill_done", 0)
+        self._backfill_done = 0
+        self._backfill_total = 0
+        if done > 0:
+            self._status_bar.showMessage(
+                f"Perceptual hash backfill complete ({done:,} computed)", 5000
+            )
 
     def _set_caption_validated(self, asset_id: str, kind: str, validated: bool) -> None:
         def op(fed: federation.Federation) -> None:
@@ -1476,12 +1541,14 @@ class MainWindow(QMainWindow):
             self._tag_panel.restore_header_state(state)
         backfill = s.value("worker/backfill_phash", defaultValue=True, type=bool)
         self._backfill_cb.setChecked(backfill)
-        batch = s.value("worker/batch_size", defaultValue=10, type=int)
+        batch = s.value("worker/batch_size", defaultValue=50, type=int)
         self._batch_size_spin.setValue(batch)
 
     def closeEvent(self, event) -> None:
         self._save_settings()
         self._poll_timer.stop()
+        if self._compute_worker:
+            self._compute_worker.shutdown(timeout=10)
         if self._bridge and self._worker:
             self._worker.shutdown(timeout=10)
         self._thumb_worker.shutdown(timeout=5)

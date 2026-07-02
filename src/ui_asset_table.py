@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Iterator, Optional
 
 from PySide6.QtCore import (
@@ -300,11 +301,22 @@ class AssetTableModel(QAbstractTableModel):
             self._pages_inflight.discard(page)
 
         def fetch_fn(fed: federation.Federation) -> list[federation.AssetRow]:
-            return list(federation.list_filtered_assets(
+            # Timing here is the measurement hook for the audit's epoch-cache
+            # decision (Phase 3.4): OFFSET pagination re-sorts the whole filtered
+            # set per page across the all_assets UNION view, which no index can
+            # serve. If these debug timings exceed ~100ms at scale, switch to
+            # materializing the sorted asset_id list once per filter epoch.
+            t0 = time.perf_counter()
+            rows = list(federation.list_filtered_assets(
                 fed, cl, fr, sr,
                 limit=PAGE_SIZE,
                 offset=offset,
             ))
+            logger.debug(
+                "page fetch offset=%d n=%d took %.1fms", offset, len(rows),
+                (time.perf_counter() - t0) * 1000.0,
+            )
+            return rows
 
         self._bridge.submit(
             fetch_fn,

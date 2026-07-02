@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea,
@@ -246,6 +246,15 @@ class FilterPanel(QWidget):
         self._filter_rows: list[_FilterRow] = []
         self._sort_rows: list[_SortRow] = []
 
+        # Coalesce value-edit keystrokes: each fires row.changed, but a full
+        # model reset per keystroke stalls the UI at 100k+ rows. Structural
+        # changes (add/remove/clear rule, dataset toggle) bypass this and emit
+        # immediately via _emit_now, which also cancels any pending keystroke.
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(250)
+        self._debounce.timeout.connect(self.filter_changed)
+
         # ── Top half: FILTERS + SORT (scrollable) ────────────────────────
         filters_label = QLabel("<b>FILTERS</b>")
         filters_label.setContentsMargins(4, 6, 4, 2)
@@ -413,7 +422,7 @@ class FilterPanel(QWidget):
     def add_filter_rule(self, rule: FilterRule) -> None:
         """Append a rule programmatically (e.g. from 'Add as Filter' in tag panel)."""
         self._add_filter_row(rule)
-        self.filter_changed.emit()
+        self._emit_now()
 
     def set_tag_names(self, names: list[str]) -> None:
         self._tag_names = names
@@ -448,15 +457,26 @@ class FilterPanel(QWidget):
                 result.append(item.data(Qt.ItemDataRole.UserRole))
         return result
 
+    # -- private: emit policy ------------------------------------------------
+
+    def _emit_now(self) -> None:
+        """Structural change — emit immediately and drop any pending keystroke."""
+        self._debounce.stop()
+        self.filter_changed.emit()
+
+    def _emit_debounced(self) -> None:
+        """Value-edit change — coalesce bursts into one emit after the interval."""
+        self._debounce.start()
+
     # -- private: filter rows ------------------------------------------------
 
     def _add_default_filter(self) -> None:
         self._add_filter_row(FilterRule("tag", "has", ""))
-        self.filter_changed.emit()
+        self._emit_now()
 
     def _add_filter_row(self, rule: FilterRule) -> None:
         row = _FilterRow(rule, self._tag_names, self._filter_body)
-        row.changed.connect(self.filter_changed)
+        row.changed.connect(self._emit_debounced)
         row.remove_requested.connect(self._remove_filter_row)
         self._filter_layout.addWidget(row)
         self._filter_rows.append(row)
@@ -466,7 +486,7 @@ class FilterPanel(QWidget):
             self._filter_rows.remove(row)
         self._filter_layout.removeWidget(row)
         row.deleteLater()
-        self.filter_changed.emit()
+        self._emit_now()
 
     def _clear_filters(self) -> None:
         for row in list(self._filter_rows):
@@ -477,7 +497,7 @@ class FilterPanel(QWidget):
         for i in range(self._datasets_list.count()):
             self._datasets_list.item(i).setCheckState(Qt.CheckState.Unchecked)
         self._datasets_list.blockSignals(False)
-        self.filter_changed.emit()
+        self._emit_now()
 
     def _on_commit_sql(self) -> None:
         clause = self._sql_edit.toPlainText().strip()
@@ -485,17 +505,17 @@ class FilterPanel(QWidget):
             return
         self._add_filter_row(FilterRule("sql", "sql", clause))
         self._sql_edit.clear()
-        self.filter_changed.emit()
+        self._emit_now()
 
     # -- private: sort rows --------------------------------------------------
 
     def _add_default_sort(self) -> None:
         self._add_sort_row(SortRule("rel_path", False))
-        self.filter_changed.emit()
+        self._emit_now()
 
     def _add_sort_row(self, rule: SortRule) -> None:
         row = _SortRow(rule, self._sort_body)
-        row.changed.connect(self.filter_changed)
+        row.changed.connect(self._emit_debounced)
         row.remove_requested.connect(self._remove_sort_row)
         self._sort_layout.addWidget(row)
         self._sort_rows.append(row)
@@ -505,7 +525,7 @@ class FilterPanel(QWidget):
             self._sort_rows.remove(row)
         self._sort_layout.removeWidget(row)
         row.deleteLater()
-        self.filter_changed.emit()
+        self._emit_now()
 
     # -- private: dataset management -----------------------------------------
 
@@ -514,7 +534,7 @@ class FilterPanel(QWidget):
         return items[0].data(Qt.ItemDataRole.UserRole) if items else None
 
     def _on_dataset_item_changed(self, _item: QListWidgetItem) -> None:
-        self.filter_changed.emit()
+        self._emit_now()
 
     def _on_dataset_selection_changed(self) -> None:
         enabled = self._selected_dataset_name() is not None
