@@ -441,6 +441,48 @@ def shard_for_asset(fed: Federation, asset_id: str) -> Shard:
     return shard
 
 
+def find_asset_by_abs_path(
+    fed: Federation, abs_path: str
+) -> Optional[tuple[Shard, "imgdb.Asset"]]:
+    """
+    Locate the (shard, asset) whose file lives at abs_path, or None if abs_path
+    is not inside any attached root or no asset is registered there. Subsumes the
+    "iterate shards, relativize, look up by rel_path" pattern used by preview/
+    mask/perceptual-hash handlers.
+    """
+    for shard in fed.shards.values():
+        try:
+            rel = os.path.relpath(abs_path, shard.abs_path).replace(os.sep, "/")
+        except ValueError:  # different drive on Windows
+            continue
+        if rel.startswith("../"):
+            continue
+        asset = imgdb.get_asset_by_rel_path(shard.conn, rel)
+        if asset is not None:
+            return shard, asset
+    return None
+
+
+def set_has_mask_by_abs_path(fed: Federation, abs_path: str, has_mask: bool) -> bool:
+    """Set has_mask for the asset at abs_path. Returns True if an asset matched."""
+    found = find_asset_by_abs_path(fed, abs_path)
+    if found is None:
+        return False
+    shard, asset = found
+    imgdb.set_has_mask(shard.conn, asset.asset_id, has_mask)
+    return True
+
+
+def set_perceptual_hash_by_abs_path(fed: Federation, abs_path: str, phash: str) -> bool:
+    """Set perceptual_hash for the asset at abs_path. Returns True if matched."""
+    found = find_asset_by_abs_path(fed, abs_path)
+    if found is None:
+        return False
+    shard, asset = found
+    imgdb.set_perceptual_hash(shard.conn, asset.asset_id, phash)
+    return True
+
+
 def shard_by_label(fed: Federation, label: str) -> Shard:
     shard = fed.shards.get(label)
     if shard is None:

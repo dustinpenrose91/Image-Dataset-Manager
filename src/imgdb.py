@@ -435,6 +435,14 @@ def get_asset(conn: sqlite3.Connection, asset_id: str) -> Asset:
     return _row_to_asset(row)
 
 
+def get_asset_by_rel_path(conn: sqlite3.Connection, rel_path: str) -> Optional[Asset]:
+    """Return the asset stored at rel_path in this shard, or None."""
+    row = conn.execute(
+        f"SELECT {_ASSET_COLS} FROM assets WHERE rel_path = ?", (rel_path,)
+    ).fetchone()
+    return _row_to_asset(row) if row is not None else None
+
+
 def list_asset_ids(conn: sqlite3.Connection) -> list[str]:
     """Every asset_id in this shard. Used by the federation index."""
     return [r["asset_id"] for r in conn.execute("SELECT asset_id FROM assets")]

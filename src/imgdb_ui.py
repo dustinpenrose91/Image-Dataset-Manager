@@ -480,31 +480,18 @@ class MainWindow(QMainWindow):
     def _on_preview_image_modified(self, abs_path: str) -> None:
         """Delete stale thumbnail files + evict all caches, then reload both panes."""
         def op(fed: federation.Federation) -> Optional[tuple[str, str, str]]:
-            for shard in fed.shards.values():
+            found = federation.find_asset_by_abs_path(fed, abs_path)
+            if found is None:
+                return None
+            shard, asset = found
+            lq = imgdb_thumbs.thumb_path(shard.abs_path, asset.asset_id, asset.file_hash)
+            hq = imgdb_thumbs.thumb_path_hq(shard.abs_path, asset.asset_id, asset.file_hash)
+            for path in (lq, hq):
                 try:
-                    rel = os.path.relpath(abs_path, shard.abs_path).replace(os.sep, "/")
-                except ValueError:
-                    continue
-                if rel.startswith("../"):
-                    continue
-                row = shard.conn.execute(
-                    "SELECT asset_id, file_hash FROM assets WHERE rel_path = ?",
-                    (rel,),
-                ).fetchone()
-                if row:
-                    lq = imgdb_thumbs.thumb_path(
-                        shard.abs_path, row["asset_id"], row["file_hash"]
-                    )
-                    hq = imgdb_thumbs.thumb_path_hq(
-                        shard.abs_path, row["asset_id"], row["file_hash"]
-                    )
-                    for path in (lq, hq):
-                        try:
-                            os.remove(path)
-                        except FileNotFoundError:
-                            pass
-                    return row["asset_id"], lq, hq
-            return None
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            return asset.asset_id, lq, hq
 
         def on_done(result: Optional[tuple[str, str, str]]) -> None:
             if result:
@@ -608,38 +595,14 @@ class MainWindow(QMainWindow):
 
     def _on_mask_saved(self, abs_path: str, has_mask: bool) -> None:
         def op(fed: federation.Federation) -> None:
-            for shard in fed.shards.values():
-                try:
-                    rel = os.path.relpath(abs_path, shard.abs_path).replace(os.sep, "/")
-                except ValueError:
-                    continue
-                if rel.startswith("../"):
-                    continue
-                row = shard.conn.execute(
-                    "SELECT asset_id FROM assets WHERE rel_path = ?", (rel,)
-                ).fetchone()
-                if row:
-                    imgdb.set_has_mask(shard.conn, row["asset_id"], has_mask)
-                    return
+            federation.set_has_mask_by_abs_path(fed, abs_path, has_mask)
 
         self._bridge.submit(op, on_error=self._show_error)
 
     def _on_perceptual_hash_ready(self, abs_path: str, phash: str) -> None:
         """Write a perceptual hash computed by the preview window into the DB."""
         def op(fed: federation.Federation) -> None:
-            for shard in fed.shards.values():
-                try:
-                    rel = os.path.relpath(abs_path, shard.abs_path).replace(os.sep, "/")
-                except ValueError:
-                    continue
-                if rel.startswith("../"):
-                    continue
-                row = shard.conn.execute(
-                    "SELECT asset_id FROM assets WHERE rel_path = ?", (rel,)
-                ).fetchone()
-                if row:
-                    imgdb.set_perceptual_hash(shard.conn, row["asset_id"], phash)
-                    return
+            federation.set_perceptual_hash_by_abs_path(fed, abs_path, phash)
 
         self._bridge.submit(op, on_error=self._show_error)
 
@@ -776,11 +739,11 @@ class MainWindow(QMainWindow):
         def fetch(fed: federation.Federation) -> tuple:
             tag_lookup = federation.build_tag_lookup(fed)
             shard = federation.shard_for_asset(fed, asset_id)
-            cap_rows = shard.conn.execute(
-                "SELECT kind, content FROM captions WHERE asset_id = ? ORDER BY kind",
-                (asset_id,),
-            ).fetchall()
-            caption_texts = {r["kind"]: (r["content"] or "") for r in cap_rows}
+            caption_texts = {
+                kind: (content or "")
+                for kind, (content, _validated)
+                in imgdb.get_captions_for_asset(shard.conn, asset_id).items()
+            }
             all_kinds = federation.list_all_caption_kinds(fed, checked)
             filtered_count = federation.count_filtered_assets(fed, checked, rules)
             total_count = federation.count_filtered_assets(fed, checked, [])
@@ -958,11 +921,11 @@ class MainWindow(QMainWindow):
 
         def fetch(fed: federation.Federation):
             def _path(aid):
-                shard = federation.shard_for_asset(fed, aid)
-                row = shard.conn.execute(
-                    "SELECT rel_path FROM assets WHERE asset_id = ?", (aid,)
-                ).fetchone()
-                return row[0] if row else aid
+                try:
+                    shard = federation.shard_for_asset(fed, aid)
+                    return imgdb.get_asset(shard.conn, aid).rel_path
+                except imgdb.AssetNotFoundError:
+                    return aid
             return _path(asset_id_a), _path(asset_id_b)
 
         def on_ready(paths) -> None:
@@ -990,10 +953,8 @@ class MainWindow(QMainWindow):
             if delete_file:
                 try:
                     shard = federation.shard_for_asset(fed, merged_id)
-                    row = shard.conn.execute(
-                        "SELECT rel_path FROM assets WHERE asset_id = ?", (merged_id,)
-                    ).fetchone()
-                    merged_abs = os.path.join(shard.abs_path, row[0]) if row else None
+                    rel = imgdb.get_asset(shard.conn, merged_id).rel_path
+                    merged_abs = os.path.join(shard.abs_path, rel)
                 except Exception:
                     pass
             federation.merge_assets(fed, survivor_id, merged_id)

@@ -428,6 +428,35 @@ class FederationWriteTests(unittest.TestCase):
         names = [canon for canon, _types in result]
         self.assertIn("sunset", names)
 
+    def test_find_asset_by_abs_path_locates_asset(self):
+        aid = self._alpha_id()
+        rel = imgdb.get_asset(self.fed.shards["alpha"].conn, aid).rel_path
+        abs_path = os.path.join(self.r1, rel)
+        found = federation.find_asset_by_abs_path(self.fed, abs_path)
+        self.assertIsNotNone(found)
+        shard, asset = found
+        self.assertEqual(shard.label, "alpha")
+        self.assertEqual(asset.asset_id, aid)
+
+    def test_find_asset_by_abs_path_outside_roots_returns_none(self):
+        self.assertIsNone(
+            federation.find_asset_by_abs_path(self.fed, "/nonexistent/path/x.png")
+        )
+
+    def test_set_has_mask_and_phash_by_abs_path(self):
+        aid = self._alpha_id()
+        conn = self.fed.shards["alpha"].conn
+        rel = imgdb.get_asset(conn, aid).rel_path
+        abs_path = os.path.join(self.r1, rel)
+        self.assertTrue(federation.set_has_mask_by_abs_path(self.fed, abs_path, True))
+        self.assertTrue(
+            federation.set_perceptual_hash_by_abs_path(self.fed, abs_path, "abc123")
+        )
+        self.assertEqual(imgdb.get_asset(conn, aid).perceptual_hash, "abc123")
+        self.assertFalse(
+            federation.set_has_mask_by_abs_path(self.fed, "/nope/x.png", True)
+        )
+
     def test_prescan_ambiguous_returns_name_with_filter(self):
         self._seed_ambiguous()
         lookup = federation.build_tag_lookup(self.fed)
