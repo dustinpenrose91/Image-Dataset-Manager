@@ -83,6 +83,18 @@ ui_*.py           Individual UI panels and dialogs (asset table, detail panel,
 
 **Worker thread ownership:** `DBWorker` and `ThumbnailWorker` create their SQLite connections inside the worker thread. Never pass connections across threads.
 
+**Compute worker (perceptual-hash backfill):** image decode+DCT must not run on the DB worker — it would block every UI read for the batch duration. `MainWindow` runs a second `DBWorker` started with a null factory (`lambda: None`, no federation) purely as a CPU thread. The backfill pipelines across three hops so reads stay responsive: DB worker fetches `(asset_id, label, abs_path)` → compute worker decodes → DB worker writes via `set_perceptual_hash`. Compute jobs only read files off disk; they never touch a SQLite connection.
+
+**Logging:** worker modules acquire `logging.getLogger(__name__)` and log (never silently swallow) failed jobs and raising `on_result`/`on_error` callbacks, while keeping the worker loop alive. Only the entry point (`imgdb_ui.main`) configures a handler; library modules never add handlers.
+
+**UI layering — no SQL in UI:** UI files contain no SQL strings. All data access goes through `imgdb`/`federation` accessors (e.g. `federation.find_asset_by_abs_path`, `imgdb.get_captions_for_asset`). Verify: `grep -rn 'execute(' src/ui_*.py src/imgdb_ui.py` returns nothing.
+
+**Write→read ordering contract:** detail-panel refresh correctness relies on direct (synchronous) signal connections: a mutation handler submits its write job to the FIFO `DBWorker` queue *before* the subsequent reload job is submitted (`ui_detail_panel.py`), so the reload always observes the write. Do not make these connections queued/async.
+
+**Filter debounce:** `FilterPanel` routes value-edit keystrokes through a single-shot `QTimer` (`_emit_debounced`, 250ms) so a full model reset does not fire per keystroke. Structural changes (add/remove rule, dataset toggle, sort) call `_emit_now`, which emits immediately and cancels any pending keystroke. Tag-suggestion rescans are similarly debounced (~1s) in `MainWindow`.
+
+**Correlated-subquery filter fields cost:** `filter_model` fields `tag_count`, `caption_count`, `duplicate_count`, `perceptual_duplicate_count` are correlated subqueries. Per-shard indexes serve each evaluation in O(shards × log n), but that is multiplied by every candidate row when used as a filter. Acceptable at current scale; if page-fetch timings (logged at `logger.debug` in `ui_asset_table._fetch_page`) show these dominate, rewrite as joins against grouped subqueries.
+
 **Worker shutdown guard:** `DBWorker.is_running` (`self._thread is not None and self._thread.is_alive()`) and its forwarding property on `QtDBBridge` are used to prevent recursive job submission after shutdown. Background batch loops (e.g. perceptual hash backfill) check `self._bridge.is_running` before re-queuing the next batch.
 
 **Tag validation:** Root labels must match `[A-Za-z_][A-Za-z0-9_]*` because they are interpolated as SQLite schema names in `ATTACH DATABASE ... AS <label>`. This is the only place SQL identifiers are interpolated; all data goes through parameterized queries.

@@ -1,6 +1,6 @@
 # imgdb — federated image dataset catalog
 
-A local GUI + CLI tool for cataloging image datasets across multiple root
+A local GUI tool for cataloging image datasets across multiple root
 directories.  Each root is its own independent SQLite database; a federation
 layer presents them as a single queryable catalog.  Files and their metadata
 stay inside their root directory — nothing is stored anywhere else.
@@ -40,7 +40,7 @@ These rules are load-bearing.  Every component is built to enforce them.
 
 ```
 imgdb.py          Per-shard library.  Single SQLite database.  No knowledge of
-                  other shards, federation, UI, or CLI.
+                  other shards, federation, or UI.
 
 federation.py     Federation layer.  Opens all attached shards, builds an
                   in-memory asset_id→shard index, creates temporary union
@@ -59,8 +59,6 @@ imgdb_worker_qt.py / imgdb_thumbs_qt.py
 
 imgdb_ui.py       Main GUI window.  Imports from all layers above.
 ui_*.py           Individual UI panels and dialogs.
-
-imgdb_cli.py      Thin CLI — argv-to-function mapping over the same library.
 ```
 
 Layers never import upward.  `imgdb.py` has no awareness of the federation,
@@ -79,11 +77,6 @@ pip install blake3 Pillow PySide6
 # Launch the GUI
 cd src
 python imgdb_ui.py
-
-# CLI (all commands accept --config <path>, default ./imgdb.conf)
-python imgdb_cli.py root attach main /home/user/photos
-python imgdb_cli.py scan main
-python imgdb_cli.py query "SELECT _root, rel_path FROM all_assets LIMIT 20"
 ```
 
 Configuration is stored in `imgdb.conf` (INI format) next to the entry point.
@@ -155,82 +148,12 @@ For single-image scope a live preview checklist shows matched tags before
 applying, with per-row checkboxes and per-row category selectors for ambiguous
 tags.
 
-## CLI commands
+## Query mode
 
-All commands accept `--config <path>` (default `./imgdb.conf`).
-
-### Root management
-
-```
-imgdb_cli.py root attach <label> <abs_path>
-imgdb_cli.py root detach <label>
-imgdb_cli.py root list
-```
-
-Labels must match `[A-Za-z_][A-Za-z0-9_]*` — they are used directly as SQLite
-schema names in `ATTACH DATABASE ... AS <label>`.  Re-attaching a label to a
-different path is rejected; detach first.
-
-`detach` removes the label from `imgdb.conf` only.  The shard database and
-root files are not touched.
-
-### scan
-
-```
-imgdb_cli.py scan <label> [--ext .jpg,.png,...] [-v]
-```
-
-Classifies each file as new / unchanged / edited / missing and updates the
-shard accordingly.  Tags, captions, and `asset_id` survive an in-place edit.
-
-### merge
-
-```
-imgdb_cli.py merge <survivor_id> <merged_id>
-```
-
-Merges metadata (tags, captions, hash history) from `merged_id` into
-`survivor_id`.  Both must belong to the same shard.  The file associated with
-`merged_id` is **not** deleted — merge is a metadata-only operation.
-
-### rename / delete
-
-```
-imgdb_cli.py rename <asset_id> <new_rel_path>
-imgdb_cli.py delete <asset_id>
-```
-
-Both are atomic: disk operation and DB update occur in a single transaction.
-
-### tag
-
-```
-imgdb_cli.py tag add    <asset_id> <tag> [<tag> ...]
-imgdb_cli.py tag remove <asset_id> <tag> [<tag> ...]
-```
-
-### caption
-
-```
-imgdb_cli.py caption set    <asset_id> <kind> <content>
-imgdb_cli.py caption set    <asset_id> <kind> --from-file <path>
-imgdb_cli.py caption delete <asset_id> <kind>
-```
-
-One caption per kind per asset.  `set` creates or updates.
-
-### query
-
-```
-imgdb_cli.py query "<SELECT statement>"
-                   [--limit N | --no-limit]
-                   [--output tsv|csv|json]
-                   [--quiet]
-```
-
-Runs a full `SELECT` against the federation's read-only connection, which has
-every attached shard ATTACH-ed and all `all_*` union views available.  Default
-limit is 20 rows unless the query already contains its own `LIMIT`.
+Switching the toolbar to **Query** exposes the federation's read-only
+connection directly.  It runs a full `SELECT` with every attached shard
+ATTACH-ed and all `all_*` union views available, and can save a result set as a
+named dataset.
 
 #### Example queries
 
@@ -252,21 +175,9 @@ SELECT current_hash, COUNT(*) AS n FROM main.assets
 GROUP BY current_hash HAVING n > 1
 ```
 
-### fts
-
-```
-imgdb_cli.py fts "<FTS5 match expression>"
-```
-
-Full-text search across all attached shards' caption tables.  FTS5 virtual
-tables cannot be exposed through union views, so this fans the query out
-per-shard in Python and unions the results.
-
-```bash
-imgdb_cli.py fts "sunset AND mountain"
-imgdb_cli.py fts '"golden hour"'
-imgdb_cli.py fts "land*"
-```
+Caption full-text search uses FTS5.  Because FTS5 virtual tables cannot be
+exposed through union views, caption search fans out per-shard in Python
+(`federation.search_captions`) rather than through the union views above.
 
 ## Schema overview (per shard)
 
