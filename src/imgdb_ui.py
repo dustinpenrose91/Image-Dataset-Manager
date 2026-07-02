@@ -43,11 +43,12 @@ from ui_asset_table import AssetTableModel, AssetTableView
 from ui_detail_panel import DetailPanel
 from ui_filter_panel import FilterPanel
 from ui_dialogs import (
-    AddToDatasetDialog, AmbiguousTagResolutionDialog,
+    AddToDatasetDialog,
     BatchMoveDialog, BatchRemoveTagDialog, BatchReplaceTagDialog, BatchTagDialog,
     BulkImportDialog, ChangeTagTypeDialog,
-    ConfirmDeleteDialog, ImportFromCaptionDialog, MergeDialog, RenameDialog, ReplaceTagDialog,
+    ConfirmDeleteDialog, MergeDialog, RenameDialog, ReplaceTagDialog,
 )
+from ui_flows import CaptionImportFlow
 from ui_preview_window import PreviewWindow
 from ui_query_tab import QueryTab
 from ui_roots_panel import RootsPanel
@@ -688,119 +689,16 @@ class MainWindow(QMainWindow):
             )
 
     def _import_from_caption(self, asset_id: str) -> None:
-        checked = self._roots_panel.checked_labels()
-        rules = self._filter_panel.current_filter_rules()
-
-        def fetch(fed: federation.Federation) -> tuple:
-            tag_lookup = federation.build_tag_lookup(fed)
-            shard = federation.shard_for_asset(fed, asset_id)
-            caption_texts = {
-                kind: (content or "")
-                for kind, (content, _validated)
-                in imgdb.get_captions_for_asset(shard.conn, asset_id).items()
-            }
-            all_kinds = federation.list_all_caption_kinds(fed, checked)
-            filtered_count = federation.count_filtered_assets(fed, checked, rules)
-            total_count = federation.count_filtered_assets(fed, checked, [])
-            return tag_lookup, caption_texts, all_kinds, filtered_count, total_count
-
-        def on_fetch(data: tuple) -> None:
-            tag_lookup, caption_texts, all_kinds, filtered_count, total_count = data
-            if not caption_texts:
-                QMessageBox.information(
-                    self, "No captions", "This asset has no captions to import from."
-                )
-                return
-
-            match_func = lambda text: federation.match_tags_in_text(text, tag_lookup)
-            dlg = ImportFromCaptionDialog(
-                caption_texts=caption_texts,
-                all_caption_kinds=all_kinds,
-                match_func=match_func,
-                filtered_count=filtered_count,
-                total_count=total_count,
-                parent=self,
-            )
-            if dlg.exec() != QDialog.DialogCode.Accepted:
-                return
-
-            scope = dlg.scope()
-            caption_kind = dlg.caption_kind()
-            ambiguous_policy = dlg.ambiguous_policy()
-
-            if scope == "single":
-                selected = dlg.selected_tags()
-                if not selected:
-                    return
-
-                def do_single(fed: federation.Federation) -> int:
-                    count = 0
-                    for name, type_name in selected:
-                        federation.add_tags(fed, asset_id, [name], type_name=type_name)
-                        count += 1
-                    return count
-
-                def on_single_done(_: int) -> None:
-                    self._refresh_tag_suggestions()
-                    self._detail_panel.load_selection(self._selected_assets, self._fed)
-                    if self._right_tabs.currentIndex() == 1:
-                        self._refresh_tag_list()
-
-                self._bridge.submit(do_single, on_result=on_single_done, on_error=self._show_error)
-                return
-
-            # Bulk scope — build kwargs shared by prescan and import.
-            if scope == "filtered":
-                bulk_kwargs: dict = dict(
-                    caption_kind=caption_kind,
-                    tag_lookup=tag_lookup,
-                    checked_labels=checked,
-                    filter_rules=rules,
-                )
-            else:  # "all" — all assets in checked shards, no other filter
-                bulk_kwargs = dict(
-                    caption_kind=caption_kind,
-                    tag_lookup=tag_lookup,
-                    checked_labels=checked,
-                )
-
-            def _do_bulk_import(resolution: dict) -> None:
-                def do_bulk(fed: federation.Federation) -> int:
-                    return federation.bulk_import_caption_tags(
-                        fed, resolution=resolution, **bulk_kwargs
-                    )
-
-                def on_bulk_done(count: int) -> None:
-                    self._refresh_tag_suggestions()
-                    self._detail_panel.load_selection(self._selected_assets, self._fed)
-                    if self._right_tabs.currentIndex() == 1:
-                        self._refresh_tag_list()
-                    noun = "assignment" if count == 1 else "assignments"
-                    QMessageBox.information(
-                        self, "Import complete",
-                        f"Added {count} tag {noun} across matching images."
-                    )
-
-                self._bridge.submit(do_bulk, on_result=on_bulk_done, on_error=self._show_error)
-
-            if ambiguous_policy == "ask":
-                def do_prescan(fed: federation.Federation) -> list:
-                    return federation.prescan_ambiguous_matches(fed, **bulk_kwargs)
-
-                def on_prescan(ambiguous: list) -> None:
-                    resolution: dict = {}
-                    if ambiguous:
-                        res_dlg = AmbiguousTagResolutionDialog(ambiguous, self)
-                        if res_dlg.exec() != QDialog.DialogCode.Accepted:
-                            return
-                        resolution = res_dlg.resolution()
-                    _do_bulk_import(resolution)
-
-                self._bridge.submit(do_prescan, on_result=on_prescan, on_error=self._show_error)
-            else:
-                _do_bulk_import({})
-
-        self._bridge.submit(fetch, on_result=on_fetch, on_error=self._show_error)
+        # Held on self so the flow object outlives its in-flight worker jobs.
+        self._caption_flow = CaptionImportFlow(
+            bridge=self._bridge,
+            parent=self,
+            checked_labels=self._roots_panel.checked_labels(),
+            filter_rules=self._filter_panel.current_filter_rules(),
+            on_tags_changed=self._on_tags_changed,
+            on_error=self._show_error,
+        )
+        self._caption_flow.start(asset_id)
 
     def _rename_asset(self, asset_id: str, current_rel_path: str) -> None:
         dlg = RenameDialog(current_rel_path, self)
