@@ -207,9 +207,12 @@ class WorkerTests(unittest.TestCase):
         def boom(_v) -> None:
             raise RuntimeError("callback exploded")
 
-        self.worker.submit(federation.scan_shard, "alpha", on_result=boom)
-        # Worker should still be alive and processing.
-        summary = call_sync(self.worker, federation.scan_shard, "beta")
+        # A raising callback must be logged (not silently swallowed) and must
+        # not take down the worker loop.
+        with self.assertLogs("imgdb_worker", level="ERROR"):
+            self.worker.submit(federation.scan_shard, "alpha", on_result=boom)
+            # Worker should still be alive and processing.
+            summary = call_sync(self.worker, federation.scan_shard, "beta")
         self.assertEqual(summary.new, 2)
 
 

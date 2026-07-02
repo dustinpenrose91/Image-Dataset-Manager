@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import logging
 import os
 import time
 import threading
@@ -60,6 +61,8 @@ except ImportError as e:
     ) from e
 
 import imgdb
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -337,10 +340,12 @@ class ThumbnailWorker:
                 try:
                     job.on_error(job.asset_id, e)
                 except Exception:
-                    pass
+                    logger.exception("thumbnail on_error callback for %s raised", job.asset_id)
+            else:
+                logger.exception("thumbnail generation for %s failed with no on_error handler", job.asset_id)
             return
         if job.on_ready is not None:
             try:
                 job.on_ready(job.asset_id, job.dest_abs_path)
             except Exception:
-                pass
+                logger.exception("thumbnail on_ready callback for %s raised", job.asset_id)

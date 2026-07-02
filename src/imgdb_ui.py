@@ -1493,7 +1493,14 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    import logging
     import signal
+
+    # Entry point owns log configuration; library modules only acquire loggers.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     config = DEFAULT_CONFIG
     if len(sys.argv) > 1:

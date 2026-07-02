@@ -159,7 +159,14 @@ class RootEntry(QWidget):
         short = rel_path if len(rel_path) <= 42 else "…" + rel_path[-41:]
         self._status_label.setText(f"↳ {short}")
 
-    def set_scan_summary(self, new: int, edited: int, unchanged: int, missing: int) -> None:
+    def set_scan_summary(
+        self,
+        new: int,
+        edited: int,
+        unchanged: int,
+        missing: int,
+        stale_staging: Optional[list[str]] = None,
+    ) -> None:
         self.set_scanning(False)
         parts = []
         if new:
@@ -170,6 +177,18 @@ class RootEntry(QWidget):
             parts.append(f"{missing} missing")
         if not parts:
             parts.append(f"{unchanged} unchanged")
+        if stale_staging:
+            # Orphaned staging files from a crashed rename/delete. Warn (orange)
+            # and surface the paths as a tooltip; the user decides whether to delete.
+            self._status_label.setStyleSheet("font-size: 11px; color: #e67e22;")
+            self._status_label.setText(
+                "⚠ " + " · ".join(parts) + f" · {len(stale_staging)} stale staging file(s)"
+            )
+            self._status_label.setToolTip(
+                "Orphaned staging files (delete manually):\n" + "\n".join(stale_staging)
+            )
+            return
+        self._status_label.setToolTip("")
         self._set_status_text("ok", extra=" · ".join(parts))
 
     def set_error(self, msg: str) -> None:
@@ -313,6 +332,7 @@ class RootsPanel(QWidget):
             return
         cancel = entry.start_scan()
         lbl = label
+        stale_staging: list[str] = []
 
         def on_event(kind: str, rel_path: str) -> None:
             # Only forward missing-file events (finish phase); batch progress
@@ -321,6 +341,10 @@ class RootsPanel(QWidget):
                 e = self._entries.get(lbl)
                 if e:
                     e.scan_event.emit(kind, rel_path)
+            elif kind == "stale_staging":
+                # Orphaned .imgdb-tmp-* file from a crashed disk op. Surface it;
+                # deletion stays a user action (invariant #6, no silent fallbacks).
+                stale_staging.append(rel_path)
 
         def on_error(exc: BaseException) -> None:
             e = self._entries.get(lbl)
@@ -333,7 +357,8 @@ class RootsPanel(QWidget):
             e = self._entries.get(lbl)
             if e:
                 e.set_scan_summary(
-                    summary.new, summary.edited, summary.unchanged, summary.missing
+                    summary.new, summary.edited, summary.unchanged, summary.missing,
+                    stale_staging=list(stale_staging),
                 )
             self.roots_changed.emit()
 

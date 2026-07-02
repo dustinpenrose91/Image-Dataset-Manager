@@ -22,6 +22,7 @@ selectedRows() to populate the detail panel.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Iterator, Optional
 
@@ -40,6 +41,8 @@ import imgdb_thumbs
 from filter_model import FilterRule, SortRule
 from imgdb_thumbs_qt import QtThumbnailBridge
 from imgdb_worker_qt import QtDBBridge
+
+logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 200          # rows loaded per fetch
 THUMB_COL_SIZE = 64      # pixels, square
@@ -107,6 +110,9 @@ class AssetTableModel(QAbstractTableModel):
         self._bridge = bridge
         self._thumb_bridge = thumb_bridge
         self._rows: list[Optional[federation.AssetRow]] = []
+        # asset_id → row index, so thumbnail-ready events are O(1) instead of a
+        # linear scan of _rows (up to full result-set size) per event.
+        self._row_by_id: dict[str, int] = {}
         self._total = 0
         self._pages_inflight: set[int] = set()
 
@@ -135,6 +141,7 @@ class AssetTableModel(QAbstractTableModel):
         self._filter_rules = filter_rules or []
         self._sort_rules = sort_rules or []
         self._rows.clear()
+        self._row_by_id.clear()
         self._pages_inflight.clear()
         self._thumb_requested.clear()
         self._thumb_dests.clear()
@@ -235,6 +242,7 @@ class AssetTableModel(QAbstractTableModel):
             self.beginResetModel()
             self._total = count
             self._rows = [None] * count
+            self._row_by_id.clear()
             self.endResetModel()
             self.selection_hint.emit(count)
             if count > 0:
@@ -245,6 +253,7 @@ class AssetTableModel(QAbstractTableModel):
             self.beginResetModel()
             self._total = 0
             self._rows = []
+            self._row_by_id.clear()
             self.endResetModel()
 
         self._bridge.submit(
@@ -279,6 +288,7 @@ class AssetTableModel(QAbstractTableModel):
                 if idx < len(self._rows):
                     self._rows[idx] = r
                     if r is not None:
+                        self._row_by_id[r.asset_id] = idx
                         self._visible_ids.discard(r.asset_id)
             if rows:
                 top = self.index(offset, 0)
@@ -354,6 +364,10 @@ class AssetTableModel(QAbstractTableModel):
 
         def on_ready_data(data) -> None:
             if data is None:
+                # Lookup failed (missing shard/asset). Drop the request marker so
+                # the next paint retries instead of leaving a permanently blank cell.
+                self._thumb_requested.discard(aid)
+                logger.warning("thumbnail path lookup returned no data for %s", aid)
                 return
             src, dest = data
             self._thumb_dests[aid] = dest
@@ -369,7 +383,12 @@ class AssetTableModel(QAbstractTableModel):
                 on_ready=lambda _aid, pix: self._on_thumb_ready(_aid, pix),
             )
 
-        self._bridge.submit(fetch, on_result=on_ready_data)
+        def on_lookup_error(exc: BaseException) -> None:
+            # Allow retry on the next paint rather than stranding a blank cell.
+            self._thumb_requested.discard(aid)
+            logger.warning("thumbnail path lookup failed for %s: %s", aid, exc)
+
+        self._bridge.submit(fetch, on_result=on_ready_data, on_error=on_lookup_error)
         return None
 
     def _find_existing_lq_thumb(self, asset: federation.AssetRow) -> Optional[str]:
@@ -403,11 +422,11 @@ class AssetTableModel(QAbstractTableModel):
         self._thumb_requested.discard(asset_id)
 
     def _on_thumb_ready(self, asset_id: str, pixmap: QPixmap) -> None:
-        for i, row in enumerate(self._rows):
-            if row is not None and row.asset_id == asset_id:
-                idx = self.index(i, COL_THUMB)
-                self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
-                break
+        i = self._row_by_id.get(asset_id)
+        if i is None or i >= len(self._rows):
+            return
+        idx = self.index(i, COL_THUMB)
+        self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
 
 
 # ---------------------------------------------------------------------------

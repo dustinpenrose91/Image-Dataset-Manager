@@ -72,6 +72,11 @@ THUMBS_DIRNAME = "imgdb_thumbs"
 SHARD_DB_FILENAME = "imgdb.sqlite"
 HASH_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 
+# Marker embedded in the sibling staging filename used by atomic disk ops
+# (rename/delete). A crash between DB commit and finalize orphans one of these;
+# scan_root surfaces them as "stale_staging" events for the user to clean up.
+STAGING_MARKER = ".imgdb-tmp-"
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -506,6 +511,23 @@ def _iter_candidate_files(
             yield abs_path, rel_path
 
 
+def _iter_stale_staging(root_abs: str) -> Iterator[str]:
+    """
+    Yield rel_path for each orphaned ``.imgdb-tmp-*`` staging file under
+    root_abs (skipping the thumbnails directory). These are left behind only
+    by a crash between DB commit and finalize; there is no legitimate reason
+    for one to persist across a scan.
+    """
+    root_abs = os.path.abspath(root_abs)
+    for dirpath, dirnames, filenames in os.walk(root_abs):
+        if os.path.abspath(dirpath) == root_abs and THUMBS_DIRNAME in dirnames:
+            dirnames.remove(THUMBS_DIRNAME)
+        for name in filenames:
+            if STAGING_MARKER in name:
+                abs_path = os.path.join(dirpath, name)
+                yield os.path.relpath(abs_path, root_abs).replace(os.sep, "/")
+
+
 SCAN_BATCH_SIZE = 500
 
 
@@ -567,6 +589,8 @@ def scan_root(
             ).fetchall()
             for row in missing_rows:
                 on_event("missing", row["rel_path"])
+            for rel_path in _iter_stale_staging(root_abs_path):
+                on_event("stale_staging", rel_path)
 
         for suffix in EXCLUDED_STEM_SUFFIXES:
             conn.execute(
@@ -701,6 +725,8 @@ def scan_root_finish(
             ).fetchall()
             for row in missing_rows:
                 on_event("missing", row["rel_path"])
+            for rel_path in _iter_stale_staging(session.root_abs_path):
+                on_event("stale_staging", rel_path)
 
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1097,7 +1123,7 @@ def rename_asset(
         )
 
     os.makedirs(os.path.dirname(new_abs) or ".", exist_ok=True)
-    staging = new_abs + f".imgdb-tmp-{uuid.uuid4().hex}"
+    staging = new_abs + f"{STAGING_MARKER}{uuid.uuid4().hex}"
     try:
         os.rename(old_abs, staging)
     except OSError as e:
@@ -1139,7 +1165,7 @@ def delete_asset(
 
     staging: Optional[str] = None
     if os.path.exists(abs_path):
-        staging = abs_path + f".imgdb-tmp-{uuid.uuid4().hex}"
+        staging = abs_path + f"{STAGING_MARKER}{uuid.uuid4().hex}"
         try:
             os.rename(abs_path, staging)
         except OSError as e:

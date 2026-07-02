@@ -221,6 +221,18 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(summary.unchanged, 1)
         self.assertEqual(summary.missing, 1)
 
+    def test_stale_staging_file_surfaced_as_event(self):
+        self._put("a.png")
+        # Simulate a crash between DB commit and finalize: an orphaned staging file.
+        staging = os.path.join(self.root, "a.png" + imgdb.STAGING_MARKER + "deadbeef")
+        with open(staging, "wb") as f:
+            f.write(b"partial")
+        events: list[tuple[str, str]] = []
+        scan_root(self.conn, self.root, on_event=lambda k, p: events.append((k, p)))
+        stale = [p for k, p in events if k == "stale_staging"]
+        self.assertEqual(len(stale), 1)
+        self.assertIn(imgdb.STAGING_MARKER, stale[0])
+
     def test_asset_id_stable_across_edit(self):
         self._put("a.png", color=(10, 0, 0))
         _, ids = scan_root(self.conn, self.root)

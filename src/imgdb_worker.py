@@ -55,10 +55,13 @@ the thread that will use them. This is enforced by SQLite's default
 from __future__ import annotations
 
 import itertools
+import logging
 import queue
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 # Job priority levels.  Lower number = higher priority.
 PRIORITY_NORMAL     = 0   # user-initiated actions (tag add, rename, page fetch, …)
@@ -284,6 +287,7 @@ class DBWorker:
     def _execute(self, job: Job) -> None:
         if job.cancelled:
             return
+        fn_name = getattr(job.fn, "__name__", repr(job.fn))
         try:
             result = job.fn(self._fed, *job.args, **job.kwargs)
         except BaseException as e:
@@ -293,13 +297,15 @@ class DBWorker:
                 except Exception:
                     # A failing error handler must not take down the
                     # worker thread.
-                    pass
+                    logger.exception("on_error callback for job %s raised", fn_name)
+            else:
+                logger.exception("job %s failed with no on_error handler", fn_name)
             return
         if job.on_result is not None:
             try:
                 job.on_result(result)
             except Exception:
-                pass
+                logger.exception("on_result callback for job %s raised", fn_name)
 
 
 # ---------------------------------------------------------------------------
