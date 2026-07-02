@@ -38,6 +38,8 @@ class AppController(QObject):
     error = Signal(object)             # (exception)
     tag_suggestions_stale = Signal()   # only the suggestion autocomplete is stale
     tags_changed = Signal()            # full tag refresh warranted
+    assets_changed = Signal(bool)      # asset set changed; arg = preserve scroll
+    datasets_changed = Signal()        # dataset membership/names changed
 
     def __init__(self, bridge: Any, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -158,4 +160,45 @@ class AppController(QObject):
         self._submit(
             lambda fed: federation.delete_tag_globally(fed, name, type_name),
             on_result=lambda _: self.tags_changed.emit(),
+        )
+
+    # -- asset mutations ----------------------------------------------------
+
+    def rename_asset(self, asset_id: str, new_rel_path: str, force: bool = False) -> None:
+        self._submit(
+            lambda fed: federation.rename_asset(fed, asset_id, new_rel_path, force=force),
+            on_result=lambda _: self.assets_changed.emit(False),
+        )
+
+    def rename_assets(self, planned: list[tuple[str, str, bool]]) -> None:
+        """Batch move: each item is (asset_id, new_rel_path, force)."""
+        def op(fed: federation.Federation) -> None:
+            for asset_id, new_rel, force in planned:
+                federation.rename_asset(fed, asset_id, new_rel, force=force)
+
+        self._submit(op, on_result=lambda _: self.assets_changed.emit(False))
+
+    def delete_assets(self, asset_ids: list[str]) -> None:
+        def op(fed: federation.Federation) -> None:
+            for asset_id in asset_ids:
+                federation.delete_asset(fed, asset_id)
+
+        self._submit(op, on_result=lambda _: self.assets_changed.emit(True))
+
+    # -- dataset membership -------------------------------------------------
+
+    def remove_from_dataset(self, name: str, asset_ids: list[str]) -> None:
+        def on_done(_: Any) -> None:
+            self.datasets_changed.emit()
+            self.assets_changed.emit(True)
+
+        self._submit(
+            lambda fed: federation.remove_from_dataset(fed, name, asset_ids),
+            on_result=on_done,
+        )
+
+    def rename_dataset(self, old_name: str, new_name: str) -> None:
+        self._submit(
+            lambda fed: federation.rename_dataset(fed, old_name, new_name),
+            on_result=lambda _: self.datasets_changed.emit(),
         )

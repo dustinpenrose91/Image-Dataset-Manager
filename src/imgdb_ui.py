@@ -330,6 +330,8 @@ class MainWindow(QMainWindow):
         self._controller.error.connect(self._show_error)
         self._controller.tag_suggestions_stale.connect(self._tag_suggest_debounce.start)
         self._controller.tags_changed.connect(self._on_tags_changed)
+        self._controller.assets_changed.connect(self._on_assets_changed)
+        self._controller.datasets_changed.connect(self._refresh_datasets)
 
         # Worker settings changes → persist immediately
         self._backfill_cb.toggled.connect(lambda _: self._save_settings())
@@ -569,6 +571,12 @@ class MainWindow(QMainWindow):
         self._refresh_tag_list()
         self._detail_panel.load_selection(self._selected_assets, self._fed)
 
+    def _on_assets_changed(self, preserve_scroll: bool) -> None:
+        if preserve_scroll:
+            self._apply_filter_preserving_scroll()
+        else:
+            self._apply_filter()
+
     def _repair_has_mask(self) -> None:
         """Fix assets where has_mask=0 but a mask file exists on disk.
 
@@ -704,15 +712,7 @@ class MainWindow(QMainWindow):
         dlg = RenameDialog(current_rel_path, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        new_rel_path = dlg.new_rel_path()
-
-        def op(fed: federation.Federation) -> None:
-            federation.rename_asset(fed, asset_id, new_rel_path)
-
-        def on_done(_) -> None:
-            self._apply_filter()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.rename_asset(asset_id, dlg.new_rel_path())
 
     def _move_asset(self, asset_id: str, new_rel_path: str) -> None:
         force = False
@@ -729,30 +729,17 @@ class MainWindow(QMainWindow):
                     if btn != QMessageBox.StandardButton.Yes:
                         return
                     force = True
-
-        def op(fed: federation.Federation) -> None:
-            federation.rename_asset(fed, asset_id, new_rel_path, force=force)
-
-        def on_done(_) -> None:
-            self._apply_filter()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.rename_asset(asset_id, new_rel_path, force=force)
 
     def _delete_asset(self, asset_id: str, rel_path: str) -> None:
         dlg = ConfirmDeleteDialog([rel_path], self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-
-        row_hint = self._table_view.currentIndex().row()
-
-        def op(fed: federation.Federation) -> None:
-            federation.delete_asset(fed, asset_id)
-
-        def on_done(_) -> None:
-            self._apply_filter_preserving_scroll()
-            self._auto_select_after_refresh(row_hint)
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        # Arm the post-refresh row reselection before the (async) delete: the
+        # controller's assets_changed → _apply_filter_preserving_scroll will
+        # reset the model, and this one-shot fires on that same reset.
+        self._auto_select_after_refresh(self._table_view.currentIndex().row())
+        self._controller.delete_assets([asset_id])
 
     def _merge_into(self, this_asset_id: str) -> None:
         """
@@ -900,29 +887,14 @@ class MainWindow(QMainWindow):
         if not planned:
             return
 
-        def op(fed: federation.Federation) -> None:
-            for asset_id, new_rel, force in planned:
-                federation.rename_asset(fed, asset_id, new_rel, force=force)
-
-        def on_done(_) -> None:
-            self._apply_filter()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.rename_assets(planned)
 
     def _batch_delete(self, assets: list[federation.AssetRow]) -> None:
         paths = [a.rel_path for a in assets]
         dlg = ConfirmDeleteDialog(paths, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-
-        def op(fed: federation.Federation) -> None:
-            for asset in assets:
-                federation.delete_asset(fed, asset.asset_id)
-
-        def on_done(_) -> None:
-            self._apply_filter_preserving_scroll()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.delete_assets([a.asset_id for a in assets])
 
     def _bulk_import(self) -> None:
         if self._fed is None:
@@ -1157,45 +1129,19 @@ class MainWindow(QMainWindow):
         new_name = new_name.strip()
         if not ok or not new_name or new_name == old_name:
             return
-
-        def op(fed: federation.Federation) -> None:
-            federation.rename_dataset(fed, old_name, new_name)
-
-        def on_done(_) -> None:
-            self._refresh_datasets()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.rename_dataset(old_name, new_name)
 
     def _remove_from_dataset(self, asset_id: str) -> None:
         checked = self._filter_panel.checked_dataset_names()
         if not checked:
             return
-        name = checked[0]
-
-        def op(fed: federation.Federation) -> None:
-            federation.remove_from_dataset(fed, name, [asset_id])
-
-        self._bridge.submit(
-            op,
-            on_result=lambda _: (self._refresh_datasets(), self._apply_filter_preserving_scroll()),
-            on_error=self._show_error,
-        )
+        self._controller.remove_from_dataset(checked[0], [asset_id])
 
     def _batch_remove_from_dataset(self, assets: list[federation.AssetRow]) -> None:
         checked = self._filter_panel.checked_dataset_names()
         if not checked:
             return
-        name = checked[0]
-        asset_ids = [a.asset_id for a in assets]
-
-        def op(fed: federation.Federation) -> None:
-            federation.remove_from_dataset(fed, name, asset_ids)
-
-        self._bridge.submit(
-            op,
-            on_result=lambda _: (self._refresh_datasets(), self._apply_filter_preserving_scroll()),
-            on_error=self._show_error,
-        )
+        self._controller.remove_from_dataset(checked[0], [a.asset_id for a in assets])
 
     def _delete_dataset(self, name: str) -> None:
         btn = QMessageBox.question(

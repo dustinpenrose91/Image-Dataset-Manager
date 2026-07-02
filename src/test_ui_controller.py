@@ -68,6 +68,8 @@ class ControllerTests(unittest.TestCase):
         self.signals: list[str] = []
         self.ctl.tags_changed.connect(lambda: self.signals.append("tags_changed"))
         self.ctl.tag_suggestions_stale.connect(lambda: self.signals.append("stale"))
+        self.ctl.assets_changed.connect(lambda p: self.signals.append(f"assets:{p}"))
+        self.ctl.datasets_changed.connect(lambda: self.signals.append("datasets"))
         self.errors: list = []
         self.ctl.error.connect(self.errors.append)
 
@@ -139,6 +141,27 @@ class ControllerTests(unittest.TestCase):
         self.ctl.add_tag("no-such-id", "sky", "General")
         self.assertTrue(self.errors)
         self.assertNotIn("stale", self.signals)
+
+    def test_rename_asset_emits_assets_changed_no_preserve(self):
+        aid = self._ids()[0]
+        old = imgdb.get_asset(self.conn, aid).rel_path
+        new_rel = "renamed_" + os.path.basename(old)
+        self.ctl.rename_asset(aid, new_rel)
+        self.assertEqual(imgdb.get_asset(self.conn, aid).rel_path, new_rel)
+        self.assertIn("assets:False", self.signals)
+
+    def test_delete_assets_emits_assets_changed_preserve(self):
+        aid = self._ids()[0]
+        self.ctl.delete_assets([aid])
+        self.assertNotIn(aid, self.fed.asset_index)
+        self.assertIn("assets:True", self.signals)
+
+    def test_remove_from_dataset_emits_both(self):
+        ids = self._ids()
+        federation.add_to_dataset(self.fed, "myset", ids)
+        self.ctl.remove_from_dataset("myset", ids)
+        self.assertIn("datasets", self.signals)
+        self.assertIn("assets:True", self.signals)
 
 
 if __name__ == "__main__":
