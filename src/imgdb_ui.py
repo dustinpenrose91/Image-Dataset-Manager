@@ -38,6 +38,7 @@ from filter_model import FilterRule, SortRule
 from imgdb_thumbs_qt import QtThumbnailBridge
 from imgdb_worker import DBWorker
 from imgdb_worker_qt import QtDBBridge
+from ui_controller import AppController
 from ui_asset_table import AssetTableModel, AssetTableView
 from ui_detail_panel import DetailPanel
 from ui_filter_panel import FilterPanel
@@ -77,6 +78,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Image Dataset Manager")
         self.showMaximized()
 
+        # Coalesce tag-suggestion rescans: each add/remove would otherwise fire
+        # list_all_tags_with_counts (a full scan of every shard's tags). Bursts
+        # of edits collapse into one rescan ~1s after the last edit. Created
+        # before _connect_signals since a controller signal connects to it.
+        self._tag_suggest_debounce = QTimer(self)
+        self._tag_suggest_debounce.setSingleShot(True)
+        self._tag_suggest_debounce.setInterval(1000)
+        self._tag_suggest_debounce.timeout.connect(self._refresh_tag_suggestions)
+
         self._setup_workers()
         self._build_ui()
         self._connect_signals()
@@ -88,14 +98,6 @@ class MainWindow(QMainWindow):
         self._poll_timer.setInterval(1000)
         self._poll_timer.timeout.connect(self._update_status)
         self._poll_timer.start()
-
-        # Coalesce tag-suggestion rescans: each add/remove would otherwise fire
-        # list_all_tags_with_counts (a full scan of every shard's tags). Bursts
-        # of edits collapse into one rescan ~1s after the last edit.
-        self._tag_suggest_debounce = QTimer(self)
-        self._tag_suggest_debounce.setSingleShot(True)
-        self._tag_suggest_debounce.setInterval(1000)
-        self._tag_suggest_debounce.timeout.connect(self._refresh_tag_suggestions)
 
     # -----------------------------------------------------------------------
     # Workers
@@ -114,6 +116,7 @@ class MainWindow(QMainWindow):
             on_warning=self._on_shard_warning,
         )
         self._bridge = QtDBBridge(self._worker)
+        self._controller = AppController(self._bridge, self)
 
         # Compute worker: same worker/bridge machinery, but no federation.
         self._compute_worker = DBWorker()
@@ -287,12 +290,12 @@ class MainWindow(QMainWindow):
         dp.move_requested.connect(self._move_asset)
         dp.delete_requested.connect(self._delete_asset)
         dp.merge_requested.connect(self._merge_into)
-        dp.tag_added.connect(self._add_tag)
-        dp.tag_removed.connect(self._remove_tag)
-        dp.caption_saved.connect(self._save_caption)
-        dp.caption_deleted.connect(self._delete_caption)
-        dp.tags_validated_changed.connect(self._set_tags_validated)
-        dp.caption_validated_changed.connect(self._set_caption_validated)
+        dp.tag_added.connect(self._controller.add_tag)
+        dp.tag_removed.connect(self._controller.remove_tag)
+        dp.caption_saved.connect(self._controller.save_caption)
+        dp.caption_deleted.connect(self._controller.delete_caption)
+        dp.tags_validated_changed.connect(self._controller.set_tags_validated)
+        dp.caption_validated_changed.connect(self._controller.set_caption_validated)
         dp.batch_tag_requested.connect(self._batch_add_tag)
         dp.batch_remove_tag_requested.connect(self._batch_remove_tag)
         dp.batch_replace_tag_requested.connect(self._batch_replace_tag)
@@ -319,8 +322,13 @@ class MainWindow(QMainWindow):
         self._right_tabs.currentChanged.connect(self._on_right_tab_changed)
 
         # Preview window signals → DB updates
-        self._preview_win.mask_saved.connect(self._on_mask_saved)
-        self._preview_win.perceptual_hash_ready.connect(self._on_perceptual_hash_ready)
+        self._preview_win.mask_saved.connect(self._controller.set_has_mask)
+        self._preview_win.perceptual_hash_ready.connect(self._controller.set_perceptual_hash)
+
+        # Controller change signals → refresh policy
+        self._controller.error.connect(self._show_error)
+        self._controller.tag_suggestions_stale.connect(self._tag_suggest_debounce.start)
+        self._controller.tags_changed.connect(self._on_tags_changed)
 
         # Worker settings changes → persist immediately
         self._backfill_cb.toggled.connect(lambda _: self._save_settings())
@@ -554,57 +562,11 @@ class MainWindow(QMainWindow):
     # Asset actions (wired from detail panel)
     # -----------------------------------------------------------------------
 
-    def _add_tag(self, asset_id: str, tag_name: str, type_name: str) -> None:
-        def op(fed: federation.Federation) -> None:
-            federation.add_tags(fed, asset_id, [tag_name], type_name=type_name)
-
-        self._bridge.submit(
-            op,
-            on_result=lambda _: self._tag_suggest_debounce.start(),
-            on_error=self._show_error,
-        )
-
-    def _remove_tag(self, asset_id: str, tag_id: str) -> None:
-        def op(fed: federation.Federation) -> None:
-            federation.remove_tags(fed, asset_id, [tag_id])
-
-        self._bridge.submit(
-            op,
-            on_result=lambda _: self._tag_suggest_debounce.start(),
-            on_error=self._show_error,
-        )
-
-    def _save_caption(self, asset_id: str, kind: str, content: str) -> None:
-        def op(fed: federation.Federation) -> None:
-            federation.set_caption(fed, asset_id, kind, content)
-
-        self._bridge.submit(op, on_error=self._show_error)
-
-    def _delete_caption(self, asset_id: str, kind: str) -> None:
-        def op(fed: federation.Federation) -> None:
-            federation.delete_caption(fed, asset_id, kind)
-
-        self._bridge.submit(op, on_error=self._show_error)
-
-    def _set_tags_validated(self, asset_id: str, validated: bool) -> None:
-        def op(fed: federation.Federation) -> None:
-            shard = federation.shard_for_asset(fed, asset_id)
-            imgdb.set_tags_validated(shard.conn, asset_id, validated)
-
-        self._bridge.submit(op, on_error=self._show_error)
-
-    def _on_mask_saved(self, abs_path: str, has_mask: bool) -> None:
-        def op(fed: federation.Federation) -> None:
-            federation.set_has_mask_by_abs_path(fed, abs_path, has_mask)
-
-        self._bridge.submit(op, on_error=self._show_error)
-
-    def _on_perceptual_hash_ready(self, abs_path: str, phash: str) -> None:
-        """Write a perceptual hash computed by the preview window into the DB."""
-        def op(fed: federation.Federation) -> None:
-            federation.set_perceptual_hash_by_abs_path(fed, abs_path, phash)
-
-        self._bridge.submit(op, on_error=self._show_error)
+    def _on_tags_changed(self) -> None:
+        """Full tag refresh after a tag-management/tag→scope mutation."""
+        self._refresh_tag_suggestions()
+        self._refresh_tag_list()
+        self._detail_panel.load_selection(self._selected_assets, self._fed)
 
     def _repair_has_mask(self) -> None:
         """Fix assets where has_mask=0 but a mask file exists on disk.
@@ -724,13 +686,6 @@ class MainWindow(QMainWindow):
             self._status_bar.showMessage(
                 f"Perceptual hash backfill complete ({done:,} computed)", 5000
             )
-
-    def _set_caption_validated(self, asset_id: str, kind: str, validated: bool) -> None:
-        def op(fed: federation.Federation) -> None:
-            shard = federation.shard_for_asset(fed, asset_id)
-            imgdb.set_caption_validated(shard.conn, asset_id, kind, validated)
-
-        self._bridge.submit(op, on_error=self._show_error)
 
     def _import_from_caption(self, asset_id: str) -> None:
         checked = self._roots_panel.checked_labels()
@@ -979,38 +934,21 @@ class MainWindow(QMainWindow):
         tags = dlg.tags()
         if not tags:
             return
-        type_name = dlg.type_name()
-
-        def op(fed: federation.Federation) -> None:
-            for tag in tags:
-                federation.add_tag_to_asset_ids(fed, asset_ids, tag, type_name)
-
-        self._bridge.submit(op, on_error=self._show_error)
+        self._controller.batch_add_tag(asset_ids, tags, dlg.type_name())
 
     def _batch_remove_tag(self, assets: list[federation.AssetRow]) -> None:
         dlg = BatchRemoveTagDialog(len(assets), self._tag_suggestions, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        tag = dlg.tag()
-
-        def op(fed: federation.Federation) -> None:
-            for asset in assets:
-                federation.remove_tags_by_name(fed, asset.asset_id, tag)
-
-        self._bridge.submit(op, on_error=self._show_error)
+        self._controller.batch_remove_tag([a.asset_id for a in assets], dlg.tag())
 
     def _batch_replace_tag(self, assets: list[federation.AssetRow]) -> None:
         dlg = BatchReplaceTagDialog(len(assets), self._tag_suggestions, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        old_tag, new_tag = dlg.old_tag(), dlg.new_tag()
-
-        def op(fed: federation.Federation) -> None:
-            for asset in assets:
-                federation.remove_tags_by_name(fed, asset.asset_id, old_tag)
-                federation.add_tags(fed, asset.asset_id, [new_tag])
-
-        self._bridge.submit(op, on_error=self._show_error)
+        self._controller.batch_replace_tag(
+            [a.asset_id for a in assets], dlg.old_tag(), dlg.new_tag()
+        )
 
     def _batch_move(self, assets: list[federation.AssetRow]) -> None:
         if not assets or self._fed is None:
@@ -1195,17 +1133,9 @@ class MainWindow(QMainWindow):
         dlg = ReplaceTagDialog(tag_name, type_name, self._tag_types, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        new_name, new_type = dlg.new_name(), dlg.new_type_name()
-
-        def op(fed: federation.Federation) -> None:
-            federation.replace_tag_globally(fed, tag_name, type_name, new_name, new_type)
-
-        def on_done(_) -> None:
-            self._refresh_tag_suggestions()
-            self._refresh_tag_list()
-            self._detail_panel.load_selection(self._selected_assets, self._fed)
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.replace_tag_globally(
+            tag_name, type_name, dlg.new_name(), dlg.new_type_name()
+        )
 
     def _tm_delete_tag(self, tag_name: str, type_name: str) -> None:
         ans = QMessageBox.question(
@@ -1216,15 +1146,7 @@ class MainWindow(QMainWindow):
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
-
-        def op(fed: federation.Federation) -> None:
-            federation.delete_tag_globally(fed, tag_name, type_name)
-
-        def on_done(_) -> None:
-            self._refresh_tag_suggestions()
-            self._refresh_tag_list()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.delete_tag_globally(tag_name, type_name)
 
     def _tm_change_type(self, tag_name: str, type_name: str) -> None:
         dlg = ChangeTagTypeDialog(tag_name, type_name, self._tag_types, self)
@@ -1233,29 +1155,14 @@ class MainWindow(QMainWindow):
         new_type = dlg.new_type_name()
         if new_type == type_name:
             return
-
-        def op(fed: federation.Federation) -> None:
-            federation.replace_tag_globally(fed, tag_name, type_name, tag_name, new_type)
-
-        def on_done(_) -> None:
-            self._refresh_tag_suggestions()
-            self._refresh_tag_list()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.replace_tag_globally(tag_name, type_name, tag_name, new_type)
 
     def _tm_add_to_selection(self, tag_name: str, type_name: str) -> None:
         if not self._selected_assets:
             return
-        asset_ids = [a.asset_id for a in self._selected_assets]
-
-        def op(fed: federation.Federation) -> None:
-            federation.add_tag_to_asset_ids(fed, asset_ids, tag_name, type_name)
-
-        def on_done(_) -> None:
-            self._refresh_tag_suggestions()
-            self._refresh_tag_list()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.add_tag_to_selection(
+            [a.asset_id for a in self._selected_assets], tag_name, type_name
+        )
 
     def _tm_add_to_filtered(self, tag_name: str, type_name: str) -> None:
         btn = QMessageBox.question(
@@ -1265,44 +1172,25 @@ class MainWindow(QMainWindow):
         )
         if btn != QMessageBox.StandardButton.Yes:
             return
-        labels = self._roots_panel.checked_labels()
-        rules = self._filter_panel.current_filter_rules()
-
-        def op(fed: federation.Federation) -> None:
-            federation.add_tag_to_filtered_assets(fed, tag_name, type_name, labels, rules)
-
-        def on_done(_) -> None:
-            self._refresh_tag_suggestions()
-            self._refresh_tag_list()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.add_tag_to_filtered(
+            tag_name, type_name,
+            self._roots_panel.checked_labels(),
+            self._filter_panel.current_filter_rules(),
+        )
 
     def _tm_remove_from_selection(self, tag_name: str, type_name: str) -> None:
         if not self._selected_assets:
             return
-        asset_ids = [a.asset_id for a in self._selected_assets]
-
-        def op(fed: federation.Federation) -> None:
-            federation.remove_tag_from_asset_ids(fed, asset_ids, tag_name, type_name)
-
-        def on_done(_) -> None:
-            self._refresh_tag_suggestions()
-            self._refresh_tag_list()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.remove_tag_from_selection(
+            [a.asset_id for a in self._selected_assets], tag_name, type_name
+        )
 
     def _tm_remove_from_filtered(self, tag_name: str, type_name: str) -> None:
-        labels = self._roots_panel.checked_labels()
-        rules = self._filter_panel.current_filter_rules()
-
-        def op(fed: federation.Federation) -> None:
-            federation.remove_tag_from_filtered_assets(fed, tag_name, type_name, labels, rules)
-
-        def on_done(_) -> None:
-            self._refresh_tag_suggestions()
-            self._refresh_tag_list()
-
-        self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
+        self._controller.remove_tag_from_filtered(
+            tag_name, type_name,
+            self._roots_panel.checked_labels(),
+            self._filter_panel.current_filter_rules(),
+        )
 
     def _refresh_datasets(self) -> None:
         def op(fed: federation.Federation) -> list[federation.DatasetInfo]:
