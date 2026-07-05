@@ -28,10 +28,15 @@ class MigrateTests(unittest.TestCase):
             CREATE TABLE captions (
                 asset_id TEXT, kind TEXT, content TEXT
             );
+            CREATE TABLE datasets (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT ''
+            );
             INSERT INTO assets (asset_id, rel_path, current_hash, phash)
                 VALUES ('id1', 'a.png', 'HHH', 'PPP');
             INSERT INTO captions (asset_id, kind, content)
                 VALUES ('id1', 'short', 'hello');
+            INSERT INTO datasets (name) VALUES ('legacy');
             """
         )
         return conn
@@ -68,6 +73,21 @@ class MigrateTests(unittest.TestCase):
         acols = [r[1] for r in conn.execute("PRAGMA table_info(assets)")]
         self.assertEqual(acols.count("file_hash"), 1)
         self.assertEqual(acols.count("perceptual_hash"), 1)
+
+    def test_dataset_id_backfilled_and_stable(self):
+        conn = self._old_shard()
+        imgdb._migrate(conn)
+        ds_id = conn.execute(
+            "SELECT dataset_id FROM datasets WHERE name = 'legacy'"
+        ).fetchone()["dataset_id"]
+        self.assertTrue(ds_id)
+        # Backfill runs on every open but only fills NULLs — the id must not
+        # be regenerated (pins reference it).
+        imgdb._migrate(conn)
+        again = conn.execute(
+            "SELECT dataset_id FROM datasets WHERE name = 'legacy'"
+        ).fetchone()["dataset_id"]
+        self.assertEqual(again, ds_id)
 
 
 if __name__ == "__main__":

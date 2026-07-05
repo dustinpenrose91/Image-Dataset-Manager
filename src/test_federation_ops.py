@@ -448,6 +448,17 @@ class FederationWriteTests(unittest.TestCase):
         self.assertEqual(listed_ids, {ids[0], ids[2]})
         self.assertNotIn(ids[1], listed_ids)
 
+    def test_dataset_info_ids_per_shard(self):
+        # Same-named dataset in two shards → one merged DatasetInfo carrying a
+        # distinct surrogate UUID per shard.
+        federation.add_to_dataset(self.fed, "shared", [self._alpha_id()])
+        federation.add_to_dataset(self.fed, "shared", [self._beta_id()])
+        infos = {ds.name: ds for ds in federation.list_datasets_federation(self.fed)}
+        ds = infos["shared"]
+        self.assertEqual(set(ds.ids), {"alpha", "beta"})
+        self.assertTrue(all(ds.ids.values()))
+        self.assertNotEqual(ds.ids["alpha"], ds.ids["beta"])
+
     def test_find_asset_by_abs_path_locates_asset(self):
         aid = self._alpha_id()
         rel = imgdb.get_asset(self.fed.shards["alpha"].conn, aid).rel_path

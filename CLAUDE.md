@@ -142,6 +142,8 @@ def _on_asset_context_menu(self, menu, assets):
     act.triggered.connect(lambda: self._some_method(assets))
 ```
 
+**Dataset surrogate keys & pins:** `datasets.dataset_id` is a UUID, backfilled by `_migrate` on every open (fills NULLs only — never regenerate, pins reference it) and stable across renames because `rename_dataset` UPDATEs the row. Pinned datasets are stored in `imgdb_ui.ini` (`datasets/pinned`, comma-joined) as UUIDs only — never names, so the centralized config leaks nothing about shard contents (invariant #1). A logical dataset is pinned if any per-shard UUID matches; `ui_pins.resolve_pins` self-heals by widening the set with sibling-shard UUIDs at display time. Pure logic in `ui_pins.py` (no Qt); persistence and rendering in `MainWindow` (`_resolve_pinned_names`, `_on_dataset_pin_toggled`).
+
 **Multi-select dataset dialog:** `AddToDatasetDialog` (in `ui_dialogs.py`) presents a "New:" text field and a checkable `QListWidget` of existing datasets. `dataset_names() -> list[str]` returns all selected names (new + checked existing). A backward-compatible `dataset_name() -> str` accessor returns the first name. The OK button is disabled until at least one name is provided.
 
 **Filter panel SQL entry:** `ui_filter_panel.py` has a dedicated `QPlainTextEdit` for raw SQL WHERE clauses (separate from the field-selector dropdown; `"sql"` is excluded from that dropdown). Clicking `+` appends a `FilterRule(field_id="sql", op="sql", value=<clause>)` to the active list. SQL rules render as monospace label + ✕ with no dropdowns.

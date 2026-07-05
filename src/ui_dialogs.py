@@ -931,6 +931,7 @@ class AddToDatasetDialog(QDialog):
         self,
         existing: list[tuple[str, int]],
         settings=None,
+        pinned: Optional[set[str]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         # Deliberately constructed without a Qt parent (callers pass none):
@@ -942,6 +943,7 @@ class AddToDatasetDialog(QDialog):
         self.setWindowTitle("Add to Dataset")
         self.setMinimumWidth(320)
         self._settings = settings
+        self._pinned = pinned or set()
 
         layout = QVBoxLayout(self)
 
@@ -1026,14 +1028,17 @@ class AddToDatasetDialog(QDialog):
         if self._list is None:
             return
         checked = set(self._checked_existing())
+        # Pinned datasets float above the chosen sort order.
         if self._sort_combo is not None and self._sort_combo.currentData() == "count":
-            rows = sorted(self._existing, key=lambda r: (-r[1], r[0].lower()))
+            key = lambda r: (r[0] not in self._pinned, -r[1], r[0].lower())
         else:
-            rows = sorted(self._existing, key=lambda r: r[0].lower())
+            key = lambda r: (r[0] not in self._pinned, r[0].lower())
+        rows = sorted(self._existing, key=key)
         self._list.blockSignals(True)
         self._list.clear()
         for name, count in rows:
-            item = QListWidgetItem(f"{name}  ({count:,})")
+            prefix = "📌 " if name in self._pinned else ""
+            item = QListWidgetItem(f"{prefix}{name}  ({count:,})")
             item.setData(Qt.ItemDataRole.UserRole, name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(

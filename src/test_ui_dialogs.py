@@ -74,6 +74,19 @@ class AddToDatasetDialogTests(unittest.TestCase):
         self.assertEqual(self._names_in_order(dlg2), ["gamma", "beta", "alpha"])
         self.assertEqual((dlg2.width(), dlg2.height()), (500, 640))
 
+    def test_pinned_float_above_both_sort_modes(self):
+        dlg = AddToDatasetDialog(
+            DATASETS, settings=self._settings(), pinned={"beta"}
+        )
+        # alpha mode: beta pinned first, then a→g among the rest
+        self.assertEqual(self._names_in_order(dlg), ["beta", "alpha", "gamma"])
+        dlg._sort_combo.setCurrentIndex(dlg._sort_combo.findData("count"))
+        # count mode: beta still first, rest by count desc
+        self.assertEqual(self._names_in_order(dlg), ["beta", "gamma", "alpha"])
+        # UserRole carries the bare name, not the glyphed display text
+        self._check(dlg, "beta")
+        self.assertEqual(dlg.dataset_names(), ["beta"])
+
     def test_no_existing_datasets_still_accepts_new_name(self):
         dlg = AddToDatasetDialog([], settings=self._settings())
         self.assertIsNone(dlg._list)

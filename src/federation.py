@@ -951,6 +951,9 @@ class DatasetInfo:
     description: str
     total_count: int
     shard_counts: dict  # label -> member_count
+    # label -> dataset_id (surrogate UUID). One per shard the dataset exists
+    # in; the same logical dataset has a different UUID in each shard.
+    ids: dict = field(default_factory=dict)
 
 
 def list_filtered_assets(
@@ -1649,16 +1652,18 @@ def list_datasets_federation(fed: Federation) -> list[DatasetInfo]:
     """
     merged: dict[str, dict] = {}
     for label, shard in fed.shards.items():
-        for name, desc, count in imgdb.list_datasets(shard.conn):
+        for name, desc, count, dataset_id in imgdb.list_datasets(shard.conn):
             if name not in merged:
-                merged[name] = {"description": desc, "shards": {}}
+                merged[name] = {"description": desc, "shards": {}, "ids": {}}
             merged[name]["shards"][label] = count
+            merged[name]["ids"][label] = dataset_id
     return [
         DatasetInfo(
             name=name,
             description=info["description"],
             total_count=sum(info["shards"].values()),
             shard_counts=dict(info["shards"]),
+            ids=dict(info["ids"]),
         )
         for name, info in sorted(merged.items())
     ]

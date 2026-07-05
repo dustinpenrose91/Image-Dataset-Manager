@@ -238,9 +238,14 @@ CREATE INDEX IF NOT EXISTS idx_merged_new ON merged_assets(new_asset_id);
 CREATE TABLE IF NOT EXISTS datasets (
     name         TEXT PRIMARY KEY,
     description  TEXT NOT NULL DEFAULT '',
+    -- Surrogate key (UUID). Stable across renames (renames UPDATE this row),
+    -- so external references (e.g. the UI's pinned-dataset config) can point
+    -- at a dataset without storing its name outside the shard.
+    dataset_id   TEXT,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_dataset_id ON datasets(dataset_id);
 
 CREATE TABLE IF NOT EXISTS dataset_assets (
     dataset_name TEXT NOT NULL REFERENCES datasets(name) ON DELETE CASCADE,
@@ -305,6 +310,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
     caption_cols = {row[1] for row in conn.execute("PRAGMA table_info(captions)")}
     if "is_validated" not in caption_cols:
         conn.execute("ALTER TABLE captions ADD COLUMN is_validated INTEGER NOT NULL DEFAULT 0")
+    dataset_cols = {row[1] for row in conn.execute("PRAGMA table_info(datasets)")}
+    if "dataset_id" not in dataset_cols:
+        conn.execute("ALTER TABLE datasets ADD COLUMN dataset_id TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_dataset_id "
+            "ON datasets(dataset_id)"
+        )
+    # Backfill on every open, not just when the column is added: heals any row
+    # created without an id so the surrogate key is always usable.
+    for row in conn.execute(
+        "SELECT name FROM datasets WHERE dataset_id IS NULL"
+    ).fetchall():
+        conn.execute(
+            "UPDATE datasets SET dataset_id = ? WHERE name = ?",
+            (str(uuid.uuid4()), row["name"]),
+        )
 
 
 def init_shard(root_abs_path: str) -> sqlite3.Connection:
@@ -1325,8 +1346,9 @@ def add_to_dataset(
     """
     with transaction(conn):
         conn.execute(
-            "INSERT OR IGNORE INTO datasets(name, description) VALUES (?, ?)",
-            (name, description),
+            "INSERT OR IGNORE INTO datasets(name, description, dataset_id) "
+            "VALUES (?, ?, ?)",
+            (name, description, str(uuid.uuid4())),
         )
         for asset_id in asset_ids:
             conn.execute(
@@ -1373,15 +1395,16 @@ def delete_dataset(conn: sqlite3.Connection, name: str) -> None:
         conn.execute("DELETE FROM datasets WHERE name = ?", (name,))
 
 
-def list_datasets(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
-    """Return (name, description, member_count) for all datasets in this shard."""
+def list_datasets(conn: sqlite3.Connection) -> list[tuple[str, str, int, str]]:
+    """Return (name, description, member_count, dataset_id) for all datasets
+    in this shard."""
     rows = conn.execute(
         """
-        SELECT d.name, d.description, COUNT(da.asset_id) AS count
+        SELECT d.name, d.description, d.dataset_id, COUNT(da.asset_id) AS count
         FROM datasets d
         LEFT JOIN dataset_assets da ON da.dataset_name = d.name
         GROUP BY d.name
         ORDER BY d.name
         """
     ).fetchall()
-    return [(r["name"], r["description"], r["count"]) for r in rows]
+    return [(r["name"], r["description"], r["count"], r["dataset_id"]) for r in rows]

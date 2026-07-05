@@ -49,6 +49,7 @@ from ui_dialogs import (
     ConfirmDeleteDialog, MergeDialog, RenameDialog, ReplaceTagDialog,
 )
 from ui_flows import CaptionImportFlow
+import ui_pins
 from ui_preview_window import PreviewWindow
 from ui_query_tab import QueryTab
 from ui_roots_panel import RootsPanel
@@ -73,6 +74,7 @@ class MainWindow(QMainWindow):
         self._tag_suggestions: list = []
         self._tag_types: list[str] = ["General"]
         self._selected_assets: list[federation.AssetRow] = []
+        self._dataset_infos: list[federation.DatasetInfo] = []
         self._thumb_worker = imgdb_thumbs.ThumbnailWorker()
         self._thumb_bridge: Optional[QtThumbnailBridge] = None
 
@@ -267,6 +269,7 @@ class MainWindow(QMainWindow):
         self._filter_panel.filter_changed.connect(self._apply_filter)
         self._filter_panel.rename_dataset_requested.connect(self._rename_dataset)
         self._filter_panel.delete_dataset_requested.connect(self._delete_dataset)
+        self._filter_panel.pin_toggle_requested.connect(self._on_dataset_pin_toggled)
 
         # Roots panel
         self._roots_panel.roots_changed.connect(self._on_roots_changed)
@@ -1067,9 +1070,49 @@ class MainWindow(QMainWindow):
             return federation.list_datasets_federation(fed)
 
         def on_ready(datasets: list[federation.DatasetInfo]) -> None:
-            self._filter_panel.set_datasets([ds.name for ds in datasets])
+            self._dataset_infos = datasets
+            self._load_dataset_panel()
 
         self._bridge.submit(op, on_result=on_ready)
+
+    def _load_dataset_panel(self) -> None:
+        """Render the cached dataset list into the filter panel, pinned first."""
+        pinned_names = self._resolve_pinned_names()
+        self._filter_panel.set_datasets(
+            [(ds.name, True) for ds in self._dataset_infos if ds.name in pinned_names]
+            + [(ds.name, False) for ds in self._dataset_infos if ds.name not in pinned_names]
+        )
+
+    # -- dataset pins ---------------------------------------------------------
+    # Stored in imgdb_ui.ini as a comma-joined set of dataset_id UUIDs — never
+    # names, so the centralized config identifies nothing about shard contents.
+
+    def _pinned_uuids(self) -> set[str]:
+        raw = self._settings().value("datasets/pinned", "")
+        return {u for u in str(raw).split(",") if u}
+
+    def _save_pinned_uuids(self, uuids: set[str]) -> None:
+        self._settings().setValue("datasets/pinned", ",".join(sorted(uuids)))
+
+    def _resolve_pinned_names(self) -> set[str]:
+        """Pin-set → names for the cached datasets; persists self-healing."""
+        pinned = self._pinned_uuids()
+        names, healed = ui_pins.resolve_pins(pinned, self._dataset_infos)
+        if healed != pinned:
+            self._save_pinned_uuids(healed)
+        return names
+
+    def _on_dataset_pin_toggled(self, name: str) -> None:
+        uuids = ui_pins.uuids_for_name(name, self._dataset_infos)
+        if not uuids:
+            return
+        pinned = self._pinned_uuids()
+        if uuids & pinned:
+            pinned -= uuids
+        else:
+            pinned |= uuids
+        self._save_pinned_uuids(pinned)
+        self._load_dataset_panel()
 
     def _add_tag_filter(self, tag: str) -> None:
         """Add a 'tag has <name>' filter rule to the browse panel."""
@@ -1081,15 +1124,22 @@ class MainWindow(QMainWindow):
         self._left_tabs.setCurrentIndex(0)
 
     @staticmethod
-    def _fetch_dataset_counts(fed: federation.Federation) -> list[tuple[str, int]]:
-        return [
-            (ds.name, ds.total_count)
-            for ds in federation.list_datasets_federation(fed)
-        ]
+    def _fetch_datasets(fed: federation.Federation) -> list[federation.DatasetInfo]:
+        return federation.list_datasets_federation(fed)
+
+    def _make_dataset_dialog(
+        self, datasets: list[federation.DatasetInfo]
+    ) -> AddToDatasetDialog:
+        self._dataset_infos = datasets  # keep the pin-resolution cache fresh
+        return AddToDatasetDialog(
+            [(ds.name, ds.total_count) for ds in datasets],
+            settings=self._settings(),
+            pinned=self._resolve_pinned_names(),
+        )
 
     def _add_to_dataset(self, asset_id: str) -> None:
-        def on_names(datasets: list[tuple[str, int]]) -> None:
-            dlg = AddToDatasetDialog(datasets, settings=self._settings())
+        def on_names(datasets: list[federation.DatasetInfo]) -> None:
+            dlg = self._make_dataset_dialog(datasets)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             dataset_names = dlg.dataset_names()
@@ -1105,14 +1155,14 @@ class MainWindow(QMainWindow):
             self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
         self._bridge.submit(
-            self._fetch_dataset_counts, on_result=on_names, on_error=self._show_error
+            self._fetch_datasets, on_result=on_names, on_error=self._show_error
         )
 
     def _batch_add_to_dataset(self, assets: list[federation.AssetRow]) -> None:
         asset_ids = [a.asset_id for a in assets]
 
-        def on_names(datasets: list[tuple[str, int]]) -> None:
-            dlg = AddToDatasetDialog(datasets, settings=self._settings())
+        def on_names(datasets: list[federation.DatasetInfo]) -> None:
+            dlg = self._make_dataset_dialog(datasets)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             dataset_names = dlg.dataset_names()
@@ -1124,7 +1174,7 @@ class MainWindow(QMainWindow):
             self._bridge.submit(op, on_result=lambda _: self._refresh_datasets(), on_error=self._show_error)
 
         self._bridge.submit(
-            self._fetch_dataset_counts, on_result=on_names, on_error=self._show_error
+            self._fetch_datasets, on_result=on_names, on_error=self._show_error
         )
 
     def _rename_dataset(self, old_name: str) -> None:
@@ -1171,8 +1221,8 @@ class MainWindow(QMainWindow):
         self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
     def _save_as_dataset(self, sql: str) -> None:
-        def on_names(datasets: list[tuple[str, int]]) -> None:
-            dlg = AddToDatasetDialog(datasets, settings=self._settings())
+        def on_names(datasets: list[federation.DatasetInfo]) -> None:
+            dlg = self._make_dataset_dialog(datasets)
             dlg.setWindowTitle("Save query as dataset…")
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -1195,7 +1245,7 @@ class MainWindow(QMainWindow):
             self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
         self._bridge.submit(
-            self._fetch_dataset_counts, on_result=on_names, on_error=self._show_error
+            self._fetch_datasets, on_result=on_names, on_error=self._show_error
         )
 
     # -----------------------------------------------------------------------

@@ -13,7 +13,7 @@ Public API:
     current_filter_rules() -> list[FilterRule]
     current_sort_rules()   -> list[SortRule]
     add_filter_rule(rule)  — append a rule (e.g. from "Add as Filter" in tag panel)
-    set_datasets(names)    — rebuild dataset checkbox list
+    set_datasets(datasets) — rebuild dataset checkbox list from (name, pinned)
     set_tag_names(names)   — update tag autocomplete in existing/future tag rows
 """
 from __future__ import annotations
@@ -23,14 +23,17 @@ from typing import Optional
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem, QMenu, QPlainTextEdit, QPushButton,
+    QScrollArea, QSizePolicy, QSplitter, QVBoxLayout, QWidget,
 )
 
 from filter_model import (
     DTYPE_OPS, FILTER_FIELDS, SORTABLE_FIELDS,
     FilterRule, SortRule,
 )
+
+# Item-data role holding the dataset's pinned flag (name lives in UserRole).
+_PINNED_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +240,7 @@ class FilterPanel(QWidget):
     filter_changed = Signal()
     rename_dataset_requested = Signal(str)   # dataset name
     delete_dataset_requested = Signal(str)   # dataset name
+    pin_toggle_requested = Signal(str)       # dataset name
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -360,6 +364,10 @@ class FilterPanel(QWidget):
         self._datasets_list.itemChanged.connect(self._on_dataset_item_changed)
         self._datasets_list.itemSelectionChanged.connect(
             self._on_dataset_selection_changed)
+        self._datasets_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._datasets_list.customContextMenuRequested.connect(
+            self._on_dataset_context_menu)
 
         self._ds_rename_btn = QPushButton("Rename…")
         self._ds_rename_btn.setEnabled(False)
@@ -429,16 +437,18 @@ class FilterPanel(QWidget):
         for row in self._filter_rows:
             row.set_tag_names(names)
 
-    def set_datasets(self, names: list[str]) -> None:
-        """Rebuild dataset list. Preserves checked and selected state by name."""
+    def set_datasets(self, datasets: list[tuple[str, bool]]) -> None:
+        """Rebuild dataset list from (name, pinned) pairs, in the given order.
+        Preserves checked and selected state by name."""
         checked = set(self.checked_dataset_names())
         selected = self._selected_dataset_name()
 
         self._datasets_list.blockSignals(True)
         self._datasets_list.clear()
-        for name in names:
-            item = QListWidgetItem(name)
+        for name, pinned in datasets:
+            item = QListWidgetItem(f"📌 {name}" if pinned else name)
             item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setData(_PINNED_ROLE, pinned)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             state = Qt.CheckState.Checked if name in checked else Qt.CheckState.Unchecked
             item.setCheckState(state)
@@ -448,6 +458,17 @@ class FilterPanel(QWidget):
         self._datasets_list.blockSignals(False)
 
         self._on_dataset_selection_changed()
+
+    def _on_dataset_context_menu(self, pos) -> None:
+        item = self._datasets_list.itemAt(pos)
+        if item is None:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        pinned = bool(item.data(_PINNED_ROLE))
+        menu = QMenu(self._datasets_list)
+        act = menu.addAction("Unpin" if pinned else "Pin")
+        act.triggered.connect(lambda: self.pin_toggle_requested.emit(name))
+        menu.exec(self._datasets_list.mapToGlobal(pos))
 
     def checked_dataset_names(self) -> list[str]:
         result = []

@@ -560,6 +560,53 @@ class MergeTests(unittest.TestCase):
             get_asset(self.conn, self.aid_b)
 
 
+class DatasetIdTests(unittest.TestCase):
+    """dataset_id surrogate keys: assigned on create, stable across rename."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.conn = init_shard(self.root)
+        _img(os.path.join(self.root, "a.png"))
+        _, ids = scan_root(self.conn, self.root)
+        self.aid = ids[0]
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.root)
+
+    def _dataset_id(self, name: str) -> str:
+        row = self.conn.execute(
+            "SELECT dataset_id FROM datasets WHERE name = ?", (name,)
+        ).fetchone()
+        return row["dataset_id"] if row else None
+
+    def test_create_assigns_uuid(self):
+        imgdb.add_to_dataset(self.conn, "myset", [self.aid])
+        ds_id = self._dataset_id("myset")
+        self.assertTrue(ds_id)
+        self.assertEqual(len(ds_id), 36)  # canonical uuid4 string
+
+    def test_id_stable_across_rename(self):
+        imgdb.add_to_dataset(self.conn, "old", [self.aid])
+        before = self._dataset_id("old")
+        imgdb.rename_dataset(self.conn, "old", "new")
+        self.assertEqual(self._dataset_id("new"), before)
+
+    def test_repeat_add_keeps_id(self):
+        imgdb.add_to_dataset(self.conn, "myset", [self.aid])
+        before = self._dataset_id("myset")
+        imgdb.add_to_dataset(self.conn, "myset", [self.aid])  # INSERT OR IGNORE
+        self.assertEqual(self._dataset_id("myset"), before)
+
+    def test_list_datasets_returns_id(self):
+        imgdb.add_to_dataset(self.conn, "myset", [self.aid])
+        rows = imgdb.list_datasets(self.conn)
+        self.assertEqual(len(rows), 1)
+        name, _desc, count, ds_id = rows[0]
+        self.assertEqual((name, count), ("myset", 1))
+        self.assertEqual(ds_id, self._dataset_id("myset"))
+
+
 class AtomicRollbackTests(unittest.TestCase):
     """A failure inside the DB transaction must restore the staged file and
     leave the DB row untouched (invariant #5)."""
