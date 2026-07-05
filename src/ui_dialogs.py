@@ -929,13 +929,19 @@ class AddToDatasetDialog(QDialog):
 
     def __init__(
         self,
-        existing_names: list[str],
+        existing: list[tuple[str, int]],
+        settings=None,
         parent: Optional[QWidget] = None,
     ) -> None:
+        # Deliberately constructed without a Qt parent (callers pass none):
+        # GNOME/Wayland "attach modal dialogs" glues a transient-for modal to
+        # its parent window, so dragging the dialog drags the main window too.
+        # exec() makes it application-modal without that relationship.
         super().__init__(parent)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
         self.setWindowTitle("Add to Dataset")
         self.setMinimumWidth(320)
+        self._settings = settings
 
         layout = QVBoxLayout(self)
 
@@ -950,18 +956,31 @@ class AddToDatasetDialog(QDialog):
         layout.addLayout(new_row)
 
         # Existing datasets as checkboxes
+        self._existing = list(existing)
         self._list: Optional[QListWidget] = None
-        if existing_names:
-            layout.addWidget(QLabel("Add to existing:"))
+        self._sort_combo: Optional[QComboBox] = None
+        if self._existing:
+            header_row = QHBoxLayout()
+            header_row.addWidget(QLabel("Add to existing:"))
+            header_row.addStretch()
+            self._sort_combo = QComboBox()
+            self._sort_combo.addItem("A–Z", "alpha")
+            self._sort_combo.addItem("Most images", "count")
+            if settings is not None:
+                idx = self._sort_combo.findData(
+                    settings.value("add_to_dataset/sort_mode", "alpha")
+                )
+                if idx >= 0:
+                    self._sort_combo.setCurrentIndex(idx)
+            self._sort_combo.currentIndexChanged.connect(lambda _: self._repopulate())
+            header_row.addWidget(self._sort_combo)
+            layout.addLayout(header_row)
+
             self._list = QListWidget()
-            self._list.setMaximumHeight(220)
-            for name in existing_names:
-                item = QListWidgetItem(name)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Unchecked)
-                self._list.addItem(item)
             self._list.itemChanged.connect(self._update_ok_state)
-            layout.addWidget(self._list)
+            # stretch=1: the list absorbs all extra vertical space on resize
+            # instead of the layout padding out the fixed-height rows.
+            layout.addWidget(self._list, stretch=1)
         else:
             hint = QLabel("No datasets yet — enter a name above to create one.")
             hint.setStyleSheet("color: gray; font-size: 11px;")
@@ -982,14 +1001,53 @@ class AddToDatasetDialog(QDialog):
         layout.addWidget(buttons)
 
         self._new_edit.textChanged.connect(self._update_ok_state)
+        self._repopulate()  # after buttons exist — it drives the OK-enabled state
         self._update_ok_state()
         self._new_edit.setFocus()
+
+        if settings is not None:
+            geom = settings.value("add_to_dataset/geometry")
+            if geom:
+                self.restoreGeometry(geom)
+
+    def done(self, result: int) -> None:
+        # Runs on accept, reject, and window close — the one choke point for
+        # persisting the user's size and sort preference.
+        if self._settings is not None:
+            self._settings.setValue("add_to_dataset/geometry", self.saveGeometry())
+            if self._sort_combo is not None:
+                self._settings.setValue(
+                    "add_to_dataset/sort_mode", self._sort_combo.currentData()
+                )
+        super().done(result)
+
+    def _repopulate(self) -> None:
+        """Rebuild the list in the selected sort order, preserving check states."""
+        if self._list is None:
+            return
+        checked = set(self._checked_existing())
+        if self._sort_combo is not None and self._sort_combo.currentData() == "count":
+            rows = sorted(self._existing, key=lambda r: (-r[1], r[0].lower()))
+        else:
+            rows = sorted(self._existing, key=lambda r: r[0].lower())
+        self._list.blockSignals(True)
+        self._list.clear()
+        for name, count in rows:
+            item = QListWidgetItem(f"{name}  ({count:,})")
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if name in checked else Qt.CheckState.Unchecked
+            )
+            self._list.addItem(item)
+        self._list.blockSignals(False)
+        self._update_ok_state()
 
     def _checked_existing(self) -> list[str]:
         if self._list is None:
             return []
         return [
-            self._list.item(i).text()
+            self._list.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(self._list.count())
             if self._list.item(i).checkState() == Qt.CheckState.Checked
         ]

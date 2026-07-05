@@ -1080,12 +1080,16 @@ class MainWindow(QMainWindow):
         self._filter_panel.add_filter_rule(FilterRule("tag", "has", tag_name))
         self._left_tabs.setCurrentIndex(0)
 
-    def _add_to_dataset(self, asset_id: str) -> None:
-        def fetch(fed: federation.Federation) -> list[str]:
-            return [ds.name for ds in federation.list_datasets_federation(fed)]
+    @staticmethod
+    def _fetch_dataset_counts(fed: federation.Federation) -> list[tuple[str, int]]:
+        return [
+            (ds.name, ds.total_count)
+            for ds in federation.list_datasets_federation(fed)
+        ]
 
-        def on_names(names: list[str]) -> None:
-            dlg = AddToDatasetDialog(names, self)
+    def _add_to_dataset(self, asset_id: str) -> None:
+        def on_names(datasets: list[tuple[str, int]]) -> None:
+            dlg = AddToDatasetDialog(datasets, settings=self._settings())
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             dataset_names = dlg.dataset_names()
@@ -1100,16 +1104,15 @@ class MainWindow(QMainWindow):
 
             self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
-        self._bridge.submit(fetch, on_result=on_names, on_error=self._show_error)
+        self._bridge.submit(
+            self._fetch_dataset_counts, on_result=on_names, on_error=self._show_error
+        )
 
     def _batch_add_to_dataset(self, assets: list[federation.AssetRow]) -> None:
         asset_ids = [a.asset_id for a in assets]
 
-        def fetch(fed: federation.Federation) -> list[str]:
-            return [ds.name for ds in federation.list_datasets_federation(fed)]
-
-        def on_names(names: list[str]) -> None:
-            dlg = AddToDatasetDialog(names, self)
+        def on_names(datasets: list[tuple[str, int]]) -> None:
+            dlg = AddToDatasetDialog(datasets, settings=self._settings())
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             dataset_names = dlg.dataset_names()
@@ -1120,7 +1123,9 @@ class MainWindow(QMainWindow):
 
             self._bridge.submit(op, on_result=lambda _: self._refresh_datasets(), on_error=self._show_error)
 
-        self._bridge.submit(fetch, on_result=on_names, on_error=self._show_error)
+        self._bridge.submit(
+            self._fetch_dataset_counts, on_result=on_names, on_error=self._show_error
+        )
 
     def _rename_dataset(self, old_name: str) -> None:
         new_name, ok = QInputDialog.getText(
@@ -1166,11 +1171,8 @@ class MainWindow(QMainWindow):
         self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
     def _save_as_dataset(self, sql: str) -> None:
-        def fetch(fed: federation.Federation) -> list[str]:
-            return [ds.name for ds in federation.list_datasets_federation(fed)]
-
-        def on_names(names: list[str]) -> None:
-            dlg = AddToDatasetDialog(names, self)
+        def on_names(datasets: list[tuple[str, int]]) -> None:
+            dlg = AddToDatasetDialog(datasets, settings=self._settings())
             dlg.setWindowTitle("Save query as dataset…")
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -1192,7 +1194,9 @@ class MainWindow(QMainWindow):
 
             self._bridge.submit(op, on_result=on_done, on_error=self._show_error)
 
-        self._bridge.submit(fetch, on_result=on_names, on_error=self._show_error)
+        self._bridge.submit(
+            self._fetch_dataset_counts, on_result=on_names, on_error=self._show_error
+        )
 
     # -----------------------------------------------------------------------
     # Error display

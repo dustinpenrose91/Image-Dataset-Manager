@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import unittest
 
-from PySide6.QtCore import QCoreApplication
 
+from qt_test_app import ensure_qapp
 from ui_tag_panel import _TagTableModel
 
 _app = None
@@ -12,7 +12,7 @@ _app = None
 
 def setUpModule():
     global _app
-    _app = QCoreApplication.instance() or QCoreApplication([])
+    _app = ensure_qapp()
 
 
 class TagTableModelTests(unittest.TestCase):

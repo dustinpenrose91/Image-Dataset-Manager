@@ -12,9 +12,9 @@ import tempfile
 import unittest
 
 from PIL import Image
-from PySide6.QtCore import QCoreApplication
 from PySide6.QtWidgets import QDialog
 
+from qt_test_app import ensure_qapp
 import federation
 import ui_flows
 from federation import add_root_to_config, open_federation, scan_shard, set_caption
@@ -25,7 +25,7 @@ _app = None
 
 def setUpModule():
     global _app
-    _app = QCoreApplication.instance() or QCoreApplication([])
+    _app = ensure_qapp()
 
 
 class _StubImportDialog:
