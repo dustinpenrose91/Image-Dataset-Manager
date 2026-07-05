@@ -74,6 +74,42 @@ class MigrateTests(unittest.TestCase):
         self.assertEqual(acols.count("file_hash"), 1)
         self.assertEqual(acols.count("perceptual_hash"), 1)
 
+    def test_open_existing_shard_missing_dataset_id_column(self):
+        """Regression: opening a pre-dataset_id shard through init_shard (which
+        runs executescript(SCHEMA_SQL) then _migrate) must not fail. The index
+        must live in _migrate, not SCHEMA_SQL, or executescript aborts with
+        'no such column: dataset_id' on the existing table."""
+        import os
+        import shutil
+        import tempfile
+
+        root = tempfile.mkdtemp()
+        try:
+            conn = imgdb.connect(imgdb.shard_db_path(root))
+            conn.executescript(
+                "CREATE TABLE datasets ("
+                "  name TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '');"
+                "INSERT INTO datasets(name) VALUES ('legacy');"
+            )
+            conn.close()
+
+            conn = imgdb.init_shard(root)  # full open path — must not raise
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(datasets)")}
+            self.assertIn("dataset_id", cols)
+            ds_id = conn.execute(
+                "SELECT dataset_id FROM datasets WHERE name = 'legacy'"
+            ).fetchone()["dataset_id"]
+            self.assertTrue(ds_id)
+            # Unique index exists (only created in _migrate now).
+            idx = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='idx_datasets_dataset_id'"
+            ).fetchone()
+            self.assertIsNotNone(idx)
+            conn.close()
+        finally:
+            shutil.rmtree(root)
+
     def test_dataset_id_backfilled_and_stable(self):
         conn = self._old_shard()
         imgdb._migrate(conn)

@@ -245,7 +245,10 @@ CREATE TABLE IF NOT EXISTS datasets (
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_dataset_id ON datasets(dataset_id);
+-- NOTE: the idx_datasets_dataset_id unique index is created in _migrate, not
+-- here. On an existing shard `CREATE TABLE IF NOT EXISTS` is a no-op so the
+-- dataset_id column isn't present until _migrate ALTERs it in; creating the
+-- index here would fail with "no such column: dataset_id" and abort the open.
 
 CREATE TABLE IF NOT EXISTS dataset_assets (
     dataset_name TEXT NOT NULL REFERENCES datasets(name) ON DELETE CASCADE,
@@ -313,10 +316,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     dataset_cols = {row[1] for row in conn.execute("PRAGMA table_info(datasets)")}
     if "dataset_id" not in dataset_cols:
         conn.execute("ALTER TABLE datasets ADD COLUMN dataset_id TEXT")
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_dataset_id "
-            "ON datasets(dataset_id)"
-        )
+    # Ensure the unique index unconditionally: the column now exists for both
+    # fresh shards (created via SCHEMA_SQL) and just-migrated old ones, and this
+    # is the only place the index is created (see the SCHEMA_SQL note).
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_datasets_dataset_id "
+        "ON datasets(dataset_id)"
+    )
     # Backfill on every open, not just when the column is added: heals any row
     # created without an id so the surrogate key is always usable.
     for row in conn.execute(

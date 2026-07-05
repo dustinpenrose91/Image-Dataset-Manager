@@ -230,6 +230,23 @@ class AttachDetachTests(unittest.TestCase):
         with self.assertRaises(RootNotFoundError):
             detach_root(self.fed, "nobody")
 
+    def test_relocate_to_same_dir_succeeds(self):
+        # Regression: relocating to the already-correct directory must NOT raise
+        # "No root with label" — that check previously conflated "unchanged
+        # path" with "label missing". Used to force a re-open of a shard that
+        # failed to open for an unrelated reason.
+        root = _make_root(self.tmp, "r", 0)
+        attach_root(self.fed, "r", root)
+        federation.relocate_root(self.fed, "r", root)  # same path
+        entries = {e.label: e.abs_path for e in load_config(self.cfg)}
+        self.assertEqual(entries["r"], os.path.abspath(root))
+
+    def test_relocate_unknown_label_raises(self):
+        root = _make_root(self.tmp, "r", 0)
+        attach_root(self.fed, "r", root)  # gives root a shard DB
+        with self.assertRaises(RootNotFoundError):
+            federation.relocate_root(self.fed, "ghost", root)
+
 
 class ListRootsTests(unittest.TestCase):
 

@@ -224,12 +224,15 @@ def relocate_root(fed: Federation, label: str, new_abs_path: str) -> None:
             f"Make sure you selected the correct directory."
         )
     entries = load_config(fed.config_path)
+    if not any(e.label == label for e in entries):
+        raise RootNotFoundError(f"No root with label {label!r} in config")
+    # Re-save even when the path is unchanged (don't conflate "unchanged" with
+    # "label missing"): relocating to the already-correct dir is a valid way to
+    # force a re-open, e.g. after a shard failed to open for another reason.
     new_entries = [
         RootEntry(label=e.label, abs_path=new_abs_path) if e.label == label else e
         for e in entries
     ]
-    if new_entries == entries:
-        raise RootNotFoundError(f"No root with label {label!r} in config")
     save_config(new_entries, fed.config_path)
 
 
