@@ -153,21 +153,32 @@ class _TagGroup(QWidget):
             header.setStyleSheet("font-size: 11px; color: #555;")
             layout.addWidget(header)
         self._chips = _FlowLayout()
+        self._chip_by_id: dict[str, _TagChip] = {}
         layout.addLayout(self._chips)
         self._input = _TagInput()
         self._input.tag_submitted.connect(self.tag_added)
         layout.addWidget(self._input)
 
     def load(self, tag_rows: list) -> None:
-        while self._chips.count():
-            item = self._chips.takeAt(0)
-            if item and item.widget():
-                item.widget().deleteLater()
+        # Diff against existing chips: destroy/recreate only the deltas so a
+        # single tag edit doesn't tear down and rebuild every chip in the group.
+        desired = {row["tag_id"]: row["name"] for row in tag_rows}
+        for tag_id in list(self._chip_by_id):
+            if tag_id not in desired:
+                chip = self._chip_by_id.pop(tag_id)
+                idx = self._chips.indexOf(chip)
+                if idx >= 0:
+                    self._chips.takeAt(idx)
+                chip.deleteLater()
         for row in tag_rows:
-            chip = _TagChip(row["name"], row["tag_id"])
+            tag_id = row["tag_id"]
+            if tag_id in self._chip_by_id:
+                continue
+            chip = _TagChip(row["name"], tag_id)
             chip.removed.connect(self.tag_removed)
             chip.filter_requested.connect(self.filter_requested)
             self._chips.addWidget(chip)
+            self._chip_by_id[tag_id] = chip
 
     def set_suggestions(self, tags: list[tuple[str, str, int]]) -> None:
         self._input.set_suggestions([t for t in tags if t[1] == self._type_name])
@@ -302,6 +313,7 @@ class _CaptionBlock(QWidget):
         validated_cb.setStyleSheet("font-size: 11px; color: #555;")
         validated_cb.setChecked(is_validated)
         validated_cb.toggled.connect(lambda v: self.validated_changed.emit(kind, v))
+        self._validated_cb = validated_cb
         del_btn = QPushButton("−")
         del_btn.setFixedWidth(22)
         del_btn.setStyleSheet("color: #c0392b; font-weight: bold;")
@@ -326,6 +338,14 @@ class _CaptionBlock(QWidget):
     def set_content(self, content: str) -> None:
         self._original = content
         self._editor.setPlainText(content)
+
+    def set_state(self, content: str, is_validated: bool) -> None:
+        """Reuse this block for another asset's caption of the same kind, without
+        emitting validated_changed for the programmatic checkbox update."""
+        self.set_content(content)
+        self._validated_cb.blockSignals(True)
+        self._validated_cb.setChecked(is_validated)
+        self._validated_cb.blockSignals(False)
 
     def _on_focus_out(self, event) -> None:
         QPlainTextEdit.focusOutEvent(self._editor, event)
@@ -533,6 +553,7 @@ class _SingleDetail(QWidget):
             self._thumb_label.set_source_pixmap(pixmap)
 
     def _load_tags_and_captions(self, asset: federation.AssetRow) -> None:
+        """Full bundle reload — used on selection change (one worker round-trip)."""
         aid = asset.asset_id
         root = asset.root
 
@@ -554,41 +575,76 @@ class _SingleDetail(QWidget):
             self._rebuild_tags(tag_rows, all_types)
             self._tags_validated_cb.setChecked(tags_validated)
             self._rebuild_captions(caps)
-            if datasets:
-                self._datasets_label.setText("Datasets: " + ", ".join(datasets))
-                self._datasets_label.show()
-            else:
-                self._datasets_label.hide()
+            self._load_datasets(datasets)
 
         self._bridge.submit(fetch, on_result=on_result)
+
+    def _load_tags(self, asset: federation.AssetRow) -> None:
+        """Reload only tags + validation state. Used after a single tag edit so a
+        tag add/remove doesn't re-fetch captions and dataset membership too."""
+        aid = asset.asset_id
+        root = asset.root
+
+        def fetch(fed: federation.Federation):
+            shard = fed.shards.get(root)
+            if shard is None:
+                return [], [], False
+            tag_rows = imgdb.get_tags_for_asset(shard.conn, aid)
+            all_types = federation.list_all_tag_types_federation(fed)
+            tags_validated = imgdb.get_tags_validated(shard.conn, aid)
+            return tag_rows, all_types, tags_validated
+
+        def on_result(data) -> None:
+            if self._asset is None or self._asset.asset_id != aid:
+                return
+            tag_rows, all_types, tags_validated = data
+            self._rebuild_tags(tag_rows, all_types)
+            self._tags_validated_cb.setChecked(tags_validated)
+
+        self._bridge.submit(fetch, on_result=on_result)
+
+    def _load_datasets(self, datasets: list) -> None:
+        if datasets:
+            self._datasets_label.setText("Datasets: " + ", ".join(datasets))
+            self._datasets_label.show()
+        else:
+            self._datasets_label.hide()
 
     def _rebuild_tags(self, tag_rows: list, all_types: list[str]) -> None:
         self._tags_section.load_tags(tag_rows, all_types)
 
     def _rebuild_captions(self, caps: dict[str, tuple[str, bool]]) -> None:
-        for block in list(self._caption_blocks.values()):
-            self._captions_container.removeWidget(block)
-            block.deleteLater()
-        self._caption_blocks.clear()
+        # Diff by kind: reuse an existing block for the same kind (update content
+        # + validated in place), add blocks for new kinds, drop blocks for gone
+        # kinds. Avoids tearing down every editor when the kind set is unchanged.
+        for kind in list(self._caption_blocks):
+            if kind not in caps:
+                block = self._caption_blocks.pop(kind)
+                self._captions_container.removeWidget(block)
+                block.deleteLater()
         for kind, (content, is_validated) in caps.items():
-            block = _CaptionBlock(kind, content, is_validated)
-            block.save_requested.connect(
-                lambda k, c: self.caption_saved.emit(self._asset.asset_id if self._asset else "", k, c)
-            )
-            block.delete_requested.connect(self._delete_caption)
-            block.validated_changed.connect(self._on_caption_validated_toggled)
-            self._captions_container.addWidget(block)
-            self._caption_blocks[kind] = block
+            block = self._caption_blocks.get(kind)
+            if block is None:
+                block = _CaptionBlock(kind, content, is_validated)
+                block.save_requested.connect(
+                    lambda k, c: self.caption_saved.emit(self._asset.asset_id if self._asset else "", k, c)
+                )
+                block.delete_requested.connect(self._delete_caption)
+                block.validated_changed.connect(self._on_caption_validated_toggled)
+                self._captions_container.addWidget(block)
+                self._caption_blocks[kind] = block
+            else:
+                block.set_state(content, is_validated)
 
     def _add_tag(self, name: str, type_name: str) -> None:
         if self._asset:
             self.tag_added.emit(self._asset.asset_id, name, type_name)
-            self._load_tags_and_captions(self._asset)
+            self._load_tags(self._asset)
 
     def _remove_tag(self, tag_id: str) -> None:
         if self._asset:
             self.tag_removed.emit(self._asset.asset_id, tag_id)
-            self._load_tags_and_captions(self._asset)
+            self._load_tags(self._asset)
 
     def _on_tags_validated_toggled(self, checked: bool) -> None:
         if self._asset:

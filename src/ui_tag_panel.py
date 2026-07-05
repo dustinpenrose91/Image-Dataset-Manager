@@ -8,17 +8,94 @@ for tag name, category, and usage count.  Buttons operate on the selected row:
   Row 2 (add):    Add to Selection, Add to Filtered
   Row 3 (remove): Remove from Selection, Remove from Filtered
   Row 4:          Add as Filter (adds a tag filter rule to the Browse panel)
+
+Backed by a QAbstractTableModel + QSortFilterProxyModel (search) so a reload
+updates only changed rows: when the tag *set* is unchanged (e.g. a count shifts
+after "Add to Selection") the model emits dataChanged for the affected counts
+and keeps selection/scroll, instead of clearing and repopulating the whole grid.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QPushButton, QTableView, QVBoxLayout, QWidget,
 )
+
+
+class _TagTableModel(QAbstractTableModel):
+    HEADERS = ["Tag", "Category", "Count"]
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._rows: list[tuple[str, str, int]] = []
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 3
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self.HEADERS[section]
+        return None
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        name, type_name, count = self._rows[index.row()]
+        col = index.column()
+        if role == Qt.ItemDataRole.DisplayRole:
+            return (name, type_name, count)[col]
+        if role == Qt.ItemDataRole.TextAlignmentRole and col == 2:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def tag_at(self, row: int) -> Optional[tuple[str, str]]:
+        if 0 <= row < len(self._rows):
+            return self._rows[row][0], self._rows[row][1]
+        return None
+
+    def set_tags(self, tags: list[tuple[str, str, int]]) -> None:
+        new_by_key = {(n, t): c for n, t, c in tags}
+        old_keys = {(r[0], r[1]) for r in self._rows}
+        if set(new_by_key) == old_keys and len(new_by_key) == len(self._rows):
+            # Same tag set — patch only the counts that moved.
+            for i, (n, t, c) in enumerate(self._rows):
+                nc = new_by_key[(n, t)]
+                if nc != c:
+                    self._rows[i] = (n, t, nc)
+                    idx = self.index(i, 2)
+                    self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
+        else:
+            self.beginResetModel()
+            self._rows = list(tags)
+            self.endResetModel()
+
+
+class _TagFilterProxy(QSortFilterProxyModel):
+    """Case-insensitive substring match against the name and category columns."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._query = ""
+
+    def set_query(self, text: str) -> None:
+        self._query = text.strip().lower()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        if not self._query:
+            return True
+        model = self.sourceModel()
+        name = model.index(source_row, 0, source_parent).data() or ""
+        type_name = model.index(source_row, 1, source_parent).data() or ""
+        return self._query in name.lower() or self._query in type_name.lower()
 
 
 class TagManagementPanel(QWidget):
@@ -42,9 +119,12 @@ class TagManagementPanel(QWidget):
         self._search_edit.setClearButtonEnabled(True)
         self._search_edit.textChanged.connect(self._apply_search_filter)
 
-        # Tag table
-        self._table = QTableWidget(0, 3)
-        self._table.setHorizontalHeaderLabels(["Tag", "Category", "Count"])
+        # Tag table — model/view with a search proxy.
+        self._model = _TagTableModel(self)
+        self._proxy = _TagFilterProxy(self)
+        self._proxy.setSourceModel(self._model)
+        self._table = QTableView()
+        self._table.setModel(self._proxy)
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         hdr.resizeSection(0, 200)
@@ -57,7 +137,7 @@ class TagManagementPanel(QWidget):
         self._table.setSortingEnabled(True)
         self._table.sortByColumn(2, Qt.SortOrder.DescendingOrder)
         self._table.verticalHeader().setVisible(False)
-        self._table.itemSelectionChanged.connect(self._update_buttons)
+        self._table.selectionModel().selectionChanged.connect(self._update_buttons)
 
         self._status_label = QLabel()
         self._status_label.setStyleSheet("color: gray; font-size: 11px;")
@@ -142,55 +222,19 @@ class TagManagementPanel(QWidget):
     def load_tags(self, tags: list[tuple[str, str, int]]) -> None:
         """Populate the table. tags: [(name, type_name, count)]"""
         self._all_tags = tags
-        self._apply_search_filter()
-
-    def _apply_search_filter(self) -> None:
-        query = self._search_edit.text().strip().lower()
-        tags = self._all_tags if not query else [
-            t for t in self._all_tags
-            if query in t[0].lower() or query in t[1].lower()
-        ]
-
         prev = self.selected_tag()
-        self._table.setSortingEnabled(False)
-        self._table.setRowCount(len(tags))
-        restore_row = -1
-        for i, (name, type_name, count) in enumerate(tags):
-            name_item = QTableWidgetItem(name)
-            type_item = QTableWidgetItem(type_name)
-            count_item = QTableWidgetItem()
-            count_item.setData(Qt.ItemDataRole.DisplayRole, count)
-            count_item.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-            self._table.setItem(i, 0, name_item)
-            self._table.setItem(i, 1, type_item)
-            self._table.setItem(i, 2, count_item)
-            if prev and (name, type_name) == prev:
-                restore_row = i
-        self._table.setSortingEnabled(True)
-
-        if restore_row >= 0:
-            self._table.selectRow(restore_row)
-
-        n = len(self._all_tags)
-        shown = len(tags)
-        if query and shown != n:
-            self._status_label.setText(f"{shown} of {n} tag{'s' if n != 1 else ''} shown")
-        else:
-            self._status_label.setText(f"{n} tag{'s' if n != 1 else ''} in filtered set")
+        self._model.set_tags(tags)
+        if prev is not None and self.selected_tag() != prev:
+            self._select_tag(prev)
+        self._update_status()
         self._update_buttons()
 
     def selected_tag(self) -> Optional[tuple[str, str]]:
         """Return (name, type_name) of the selected row, or None."""
-        row = self._table.currentRow()
-        if row < 0 or not self._table.selectedItems():
+        idx = self._table.currentIndex()
+        if not idx.isValid() or not self._table.selectionModel().hasSelection():
             return None
-        name_item = self._table.item(row, 0)
-        type_item = self._table.item(row, 1)
-        if name_item is None or type_item is None:
-            return None
-        return name_item.text(), type_item.text()
+        return self._model.tag_at(self._proxy.mapToSource(idx).row())
 
     def save_header_state(self) -> bytes:
         return bytes(self._table.horizontalHeader().saveState())
@@ -204,6 +248,26 @@ class TagManagementPanel(QWidget):
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
 
     # -- private --------------------------------------------------------------
+
+    def _apply_search_filter(self) -> None:
+        self._proxy.set_query(self._search_edit.text())
+        self._update_status()
+        self._update_buttons()
+
+    def _select_tag(self, tag: tuple[str, str]) -> None:
+        for proxy_row in range(self._proxy.rowCount()):
+            src = self._proxy.mapToSource(self._proxy.index(proxy_row, 0))
+            if self._model.tag_at(src.row()) == tag:
+                self._table.selectRow(proxy_row)
+                return
+
+    def _update_status(self) -> None:
+        n = len(self._all_tags)
+        shown = self._proxy.rowCount()
+        if self._search_edit.text().strip() and shown != n:
+            self._status_label.setText(f"{shown} of {n} tag{'s' if n != 1 else ''} shown")
+        else:
+            self._status_label.setText(f"{n} tag{'s' if n != 1 else ''} in filtered set")
 
     def _update_buttons(self) -> None:
         enabled = self.selected_tag() is not None
