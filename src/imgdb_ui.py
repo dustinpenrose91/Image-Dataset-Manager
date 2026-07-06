@@ -1190,12 +1190,17 @@ class MainWindow(QMainWindow):
         checked = self._filter_panel.checked_dataset_names()
         if not checked:
             return
+        # Same as delete: when the removed asset drops out of the active dataset
+        # filter, reselect the row at its position after the refresh so the view
+        # stays put instead of jumping to the top.
+        self._auto_select_after_refresh(self._table_view.currentIndex().row())
         self._controller.remove_from_dataset(checked[0], [asset_id])
 
     def _batch_remove_from_dataset(self, assets: list[federation.AssetRow]) -> None:
         checked = self._filter_panel.checked_dataset_names()
         if not checked:
             return
+        self._auto_select_after_refresh(self._table_view.currentIndex().row())
         self._controller.remove_from_dataset(checked[0], [a.asset_id for a in assets])
 
     def _delete_dataset(self, name: str) -> None:
