@@ -258,6 +258,20 @@ CREATE TABLE IF NOT EXISTS dataset_assets (
 );
 CREATE INDEX IF NOT EXISTS idx_dataset_assets_asset ON dataset_assets(asset_id);
 CREATE INDEX IF NOT EXISTS idx_dataset_assets_name  ON dataset_assets(dataset_name);
+
+-- Vertical EAV (entity-attribute-value) store for per-image data. New kinds of
+-- data become new rows, not new columns, so tracking another attribute never
+-- needs a schema migration. Booleans are stored presence-style (value '1' when
+-- true, row absent when false) so the (key, value) index serves filters cheaply
+-- and the table stays small. The idx on (key, value) backs attribute filters
+-- like "is_favorite = 1" without scanning assets.
+CREATE TABLE IF NOT EXISTS image_attributes (
+    asset_id  TEXT NOT NULL REFERENCES assets(asset_id) ON DELETE CASCADE,
+    key       TEXT NOT NULL,
+    value     TEXT,
+    PRIMARY KEY (asset_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_image_attributes_key ON image_attributes(key, value);
 """
 
 
@@ -640,6 +654,7 @@ def scan_root(
             """
         )
         summary.missing = cur.rowcount or 0
+        _mark_last_scan(conn, new_ids)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -781,6 +796,7 @@ def scan_root_finish(
                 """
             )
             session.summary.missing = cur.rowcount or 0
+            _mark_last_scan(conn, session.new_ids)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -792,6 +808,19 @@ def scan_root_finish(
             pass
 
     return session.summary, session.new_ids
+
+
+def _mark_last_scan(conn: sqlite3.Connection, new_ids: list[str]) -> None:
+    """Flag exactly the assets added by the just-completed scan as
+    is_last_scan, clearing the flag from everything else in this shard. Runs
+    inside the scan's final transaction (no BEGIN of its own)."""
+    conn.execute(
+        "DELETE FROM image_attributes WHERE key = ?", (ATTR_IS_LAST_SCAN,)
+    )
+    conn.executemany(
+        "INSERT INTO image_attributes(asset_id, key, value) VALUES (?, ?, '1')",
+        [(aid, ATTR_IS_LAST_SCAN) for aid in new_ids],
+    )
 
 
 def _ingest_file(
@@ -1064,6 +1093,70 @@ def set_has_mask(conn: sqlite3.Connection, asset_id: str, has_mask: bool) -> Non
             "UPDATE assets SET has_mask = ? WHERE asset_id = ?",
             (1 if has_mask else 0, asset_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Image attributes (vertical EAV store — see the image_attributes schema note)
+# ---------------------------------------------------------------------------
+
+# Well-known attribute keys. New keys can be added freely without a migration.
+ATTR_IS_FAVORITE = "is_favorite"
+ATTR_IS_LAST_SCAN = "is_last_scan"
+
+
+def set_image_attribute(
+    conn: sqlite3.Connection, asset_id: str, key: str, value: str
+) -> None:
+    """Upsert a single attribute value for an image."""
+    with transaction(conn):
+        conn.execute(
+            "INSERT INTO image_attributes(asset_id, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(asset_id, key) DO UPDATE SET value = excluded.value",
+            (asset_id, key, value),
+        )
+
+
+def get_image_attribute(
+    conn: sqlite3.Connection, asset_id: str, key: str
+) -> Optional[str]:
+    row = conn.execute(
+        "SELECT value FROM image_attributes WHERE asset_id = ? AND key = ?",
+        (asset_id, key),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def delete_image_attribute(conn: sqlite3.Connection, asset_id: str, key: str) -> None:
+    with transaction(conn):
+        conn.execute(
+            "DELETE FROM image_attributes WHERE asset_id = ? AND key = ?",
+            (asset_id, key),
+        )
+
+
+def get_image_attributes(conn: sqlite3.Connection, asset_id: str) -> dict[str, str]:
+    """All attributes for an image as {key: value}."""
+    return {
+        r["key"]: r["value"]
+        for r in conn.execute(
+            "SELECT key, value FROM image_attributes WHERE asset_id = ?", (asset_id,)
+        )
+    }
+
+
+def set_image_flag(
+    conn: sqlite3.Connection, asset_id: str, key: str, on: bool
+) -> None:
+    """Boolean attribute stored presence-style: value '1' when on, row removed
+    when off (keeps the table small; filters test for the row's existence)."""
+    if on:
+        set_image_attribute(conn, asset_id, key, "1")
+    else:
+        delete_image_attribute(conn, asset_id, key)
+
+
+def get_image_flag(conn: sqlite3.Connection, asset_id: str, key: str) -> bool:
+    return get_image_attribute(conn, asset_id, key) == "1"
 
 
 def get_dataset_membership(

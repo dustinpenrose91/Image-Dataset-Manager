@@ -69,6 +69,13 @@ FILTER_FIELDS: dict[str, FilterField] = {
         FilterField("exists_flag",   "File exists",           "boolean", "{alias}.exists_flag"),
         FilterField("has_mask",      "Has mask",              "boolean", "{alias}.has_mask"),
         FilterField("tags_validated","Tags validated",        "boolean", "{alias}.tags_validated"),
+        # EAV-backed booleans (image_attributes). Presence of value '1' = true.
+        FilterField("is_favorite",   "Favorite",              "boolean",
+            "(SELECT 1 FROM all_image_attributes"
+            " WHERE asset_id = {alias}.asset_id AND key = 'is_favorite' AND value = '1')"),
+        FilterField("is_last_scan",  "New in last scan",      "boolean",
+            "(SELECT 1 FROM all_image_attributes"
+            " WHERE asset_id = {alias}.asset_id AND key = 'is_last_scan' AND value = '1')"),
         FilterField("tag_count",     "Tag count",             "integer",
             "(SELECT COUNT(*) FROM all_asset_tags WHERE asset_id = {alias}.asset_id)"),
         FilterField("caption_count", "Caption count",         "integer",

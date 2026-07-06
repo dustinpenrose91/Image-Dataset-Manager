@@ -290,6 +290,7 @@ class MainWindow(QMainWindow):
 
         # Detail panel actions
         dp = self._detail_panel
+        dp.favorite_changed.connect(self._controller.set_favorite)
         dp.rename_requested.connect(self._rename_asset)
         dp.move_requested.connect(self._move_asset)
         dp.delete_requested.connect(self._delete_asset)

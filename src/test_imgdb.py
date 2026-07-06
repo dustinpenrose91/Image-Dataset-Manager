@@ -560,6 +560,106 @@ class MergeTests(unittest.TestCase):
             get_asset(self.conn, self.aid_b)
 
 
+class ImageAttributeTests(unittest.TestCase):
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.conn = init_shard(self.root)
+        _img(os.path.join(self.root, "a.png"))
+        _, ids = scan_root(self.conn, self.root)
+        self.aid = ids[0]
+        # scan_root flags the new asset is_last_scan; clear it so these tests
+        # observe only the attributes they set.
+        imgdb.delete_image_attribute(self.conn, self.aid, imgdb.ATTR_IS_LAST_SCAN)
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.root)
+
+    def test_set_get_delete_attribute(self):
+        imgdb.set_image_attribute(self.conn, self.aid, "rating", "5")
+        self.assertEqual(imgdb.get_image_attribute(self.conn, self.aid, "rating"), "5")
+        imgdb.set_image_attribute(self.conn, self.aid, "rating", "3")  # upsert
+        self.assertEqual(imgdb.get_image_attribute(self.conn, self.aid, "rating"), "3")
+        imgdb.delete_image_attribute(self.conn, self.aid, "rating")
+        self.assertIsNone(imgdb.get_image_attribute(self.conn, self.aid, "rating"))
+
+    def test_get_attributes_map(self):
+        imgdb.set_image_attribute(self.conn, self.aid, "a", "1")
+        imgdb.set_image_attribute(self.conn, self.aid, "b", "x")
+        self.assertEqual(
+            imgdb.get_image_attributes(self.conn, self.aid), {"a": "1", "b": "x"}
+        )
+
+    def test_flag_presence_style(self):
+        self.assertFalse(imgdb.get_image_flag(self.conn, self.aid, imgdb.ATTR_IS_FAVORITE))
+        imgdb.set_image_flag(self.conn, self.aid, imgdb.ATTR_IS_FAVORITE, True)
+        self.assertTrue(imgdb.get_image_flag(self.conn, self.aid, imgdb.ATTR_IS_FAVORITE))
+        self.assertEqual(
+            imgdb.get_image_attribute(self.conn, self.aid, imgdb.ATTR_IS_FAVORITE), "1"
+        )
+        imgdb.set_image_flag(self.conn, self.aid, imgdb.ATTR_IS_FAVORITE, False)
+        self.assertFalse(imgdb.get_image_flag(self.conn, self.aid, imgdb.ATTR_IS_FAVORITE))
+        # Off = row removed, not a stored '0'.
+        self.assertEqual(imgdb.get_image_attributes(self.conn, self.aid), {})
+
+    def test_attribute_cascades_on_asset_delete(self):
+        imgdb.set_image_flag(self.conn, self.aid, imgdb.ATTR_IS_FAVORITE, True)
+        delete_asset(self.conn, self.root, self.aid)
+        n = self.conn.execute("SELECT COUNT(*) FROM image_attributes").fetchone()[0]
+        self.assertEqual(n, 0)
+
+
+class LastScanFlagTests(unittest.TestCase):
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.conn = init_shard(self.root)
+
+    def tearDown(self):
+        self.conn.close()
+        shutil.rmtree(self.root)
+
+    def _put(self, rel: str, color=(0, 0, 0)) -> None:
+        _img(os.path.join(self.root, rel), color=color)
+
+    def _flag(self, aid: str) -> bool:
+        return imgdb.get_image_flag(self.conn, aid, imgdb.ATTR_IS_LAST_SCAN)
+
+    def _id_for(self, rel: str) -> str:
+        return self.conn.execute(
+            "SELECT asset_id FROM assets WHERE rel_path = ?", (rel,)
+        ).fetchone()["asset_id"]
+
+    def test_new_assets_flagged_and_recleared_next_scan(self):
+        self._put("a.png"); self._put("b.png")
+        scan_root(self.conn, self.root)
+        a, b = self._id_for("a.png"), self._id_for("b.png")
+        self.assertTrue(self._flag(a))
+        self.assertTrue(self._flag(b))
+
+        # Next scan adds c.png: only c is flagged; a and b cleared.
+        self._put("c.png", color=(9, 9, 9))
+        scan_root(self.conn, self.root)
+        c = self._id_for("c.png")
+        self.assertTrue(self._flag(c))
+        self.assertFalse(self._flag(a))
+        self.assertFalse(self._flag(b))
+
+    def test_incremental_scan_flags_new(self):
+        self._put("a.png")
+        scan_root(self.conn, self.root)
+        a = self._id_for("a.png")
+        self._put("b.png", color=(5, 5, 5))
+        session = imgdb.scan_root_init(self.conn, self.root)
+        while not imgdb.scan_root_batch(self.conn, session):
+            pass
+        imgdb.scan_root_finish(self.conn, session)
+        b = self._id_for("b.png")
+        self.assertTrue(self._flag(b))
+        self.assertFalse(self._flag(a))
+
+
 class DatasetIdTests(unittest.TestCase):
     """dataset_id surrogate keys: assigned on create, stable across rename."""
 

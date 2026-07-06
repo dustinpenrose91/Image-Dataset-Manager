@@ -361,6 +361,7 @@ class _CaptionBlock(QWidget):
 
 class _SingleDetail(QWidget):
 
+    favorite_changed = Signal(str, bool)          # asset_id, is_favorite
     rename_requested = Signal(str, str)           # asset_id, current_rel_path
     move_requested = Signal(str, str)             # asset_id, new_rel_path
     delete_requested = Signal(str, str)           # asset_id, rel_path
@@ -389,9 +390,20 @@ class _SingleDetail(QWidget):
         self._root_abs: Optional[str] = None
         self._caption_blocks: dict[str, _CaptionBlock] = {}
         self._active_dataset: Optional[str] = None
+        self._is_favorite = False
 
-        # Thumbnail
+        # Thumbnail, with a favorite star overlaid at the top-left. The star is
+        # an absolutely-positioned child of the label (not in any layout), so
+        # showing/hiding it never shifts the center-aligned thumbnail image.
         self._thumb_label = _ScaledThumbnailLabel()
+        self._fav_star = QLabel("★", self._thumb_label)
+        self._fav_star.setStyleSheet(
+            "color: #f1c40f; font-size: 22px; background: transparent;"
+        )
+        self._fav_star.setToolTip("Favorited")
+        self._fav_star.adjustSize()
+        self._fav_star.move(4, 4)
+        self._fav_star.hide()
 
         # Metadata
         self._meta_label = _FlexLabel()
@@ -439,6 +451,9 @@ class _SingleDetail(QWidget):
         sep3 = _sep()
 
         # Actions
+        self._favorite_btn = QPushButton("☆ Favorite")
+        self._favorite_btn.setCheckable(True)
+        self._favorite_btn.clicked.connect(self._on_favorite_clicked)
         rename_btn = QPushButton("Rename…")
         rename_btn.clicked.connect(self._rename)
         move_btn = QPushButton("Move…")
@@ -456,6 +471,7 @@ class _SingleDetail(QWidget):
         self._remove_from_dataset_btn.hide()
 
         actions_row = QHBoxLayout()
+        actions_row.addWidget(self._favorite_btn)
         actions_row.addWidget(rename_btn)
         actions_row.addWidget(move_btn)
         actions_row.addWidget(delete_btn)
@@ -504,6 +520,7 @@ class _SingleDetail(QWidget):
         self._asset = asset
         self._root_abs = root_abs
         self._thumb_label.set_source_pixmap(None)
+        self._apply_favorite_state(False)  # reset until the fetch reports it
         self._meta_label.setText(
             f"<b>{asset.rel_path}</b><br>"
             f"Root: {asset.root}<br>"
@@ -560,24 +577,42 @@ class _SingleDetail(QWidget):
         def fetch(fed: federation.Federation):
             shard = fed.shards.get(root)
             if shard is None:
-                return [], {}, [], [], False
+                return [], {}, [], [], False, False
             tag_rows = imgdb.get_tags_for_asset(shard.conn, aid)
             caps = imgdb.get_captions_for_asset(shard.conn, aid)
             all_types = federation.list_all_tag_types_federation(fed)
             datasets = imgdb.get_dataset_membership(shard.conn, aid)
             tags_validated = imgdb.get_tags_validated(shard.conn, aid)
-            return tag_rows, caps, all_types, datasets, tags_validated
+            is_favorite = imgdb.get_image_flag(shard.conn, aid, imgdb.ATTR_IS_FAVORITE)
+            return tag_rows, caps, all_types, datasets, tags_validated, is_favorite
 
         def on_result(data) -> None:
             if self._asset is None or self._asset.asset_id != aid:
                 return
-            tag_rows, caps, all_types, datasets, tags_validated = data
+            tag_rows, caps, all_types, datasets, tags_validated, is_favorite = data
             self._rebuild_tags(tag_rows, all_types)
             self._tags_validated_cb.setChecked(tags_validated)
             self._rebuild_captions(caps)
             self._load_datasets(datasets)
+            self._apply_favorite_state(is_favorite)
 
         self._bridge.submit(fetch, on_result=on_result)
+
+    def _apply_favorite_state(self, on: bool) -> None:
+        self._is_favorite = on
+        self._favorite_btn.setChecked(on)
+        self._favorite_btn.setText("★ Favorited" if on else "☆ Favorite")
+        self._fav_star.setVisible(on)
+        if on:
+            self._fav_star.raise_()
+
+    def _on_favorite_clicked(self) -> None:
+        if self._asset is None:
+            self._favorite_btn.setChecked(self._is_favorite)  # nothing selected
+            return
+        on = self._favorite_btn.isChecked()
+        self._apply_favorite_state(on)
+        self.favorite_changed.emit(self._asset.asset_id, on)
 
     def _load_tags(self, asset: federation.AssetRow) -> None:
         """Reload only tags + validation state. Used after a single tag edit so a
@@ -826,6 +861,7 @@ class DetailPanel(QWidget):
     """
 
     # Forward all action signals so the main window can connect them once.
+    favorite_changed = Signal(str, bool)
     rename_requested = Signal(str, str)
     move_requested = Signal(str, str)
     delete_requested = Signal(str, str)
@@ -864,6 +900,7 @@ class DetailPanel(QWidget):
         self._empty.setStyleSheet("color: gray; font-size: 13px;")
 
         self._single = _SingleDetail(bridge, thumb_bridge)
+        self._single.favorite_changed.connect(self.favorite_changed)
         self._single.rename_requested.connect(self.rename_requested)
         self._single.move_requested.connect(self.move_requested)
         self._single.delete_requested.connect(self.delete_requested)

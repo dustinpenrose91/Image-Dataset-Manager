@@ -465,6 +465,37 @@ class FederationWriteTests(unittest.TestCase):
         self.assertEqual(listed_ids, {ids[0], ids[2]})
         self.assertNotIn(ids[1], listed_ids)
 
+    def test_image_flag_routing_and_filter(self):
+        from filter_model import FilterRule
+        aid = self._alpha_id()
+        federation.set_image_flag(self.fed, aid, imgdb.ATTR_IS_FAVORITE, True)
+        self.assertTrue(federation.get_image_flag(self.fed, aid, imgdb.ATTR_IS_FAVORITE))
+
+        # Filter to favorites-only via the all_image_attributes view.
+        fav_rule = FilterRule("is_favorite", "is_true", "")
+        got = {
+            a.asset_id
+            for a in federation.list_filtered_assets(self.fed, None, [fav_rule], [])
+        }
+        self.assertEqual(got, {aid})
+
+        # is_false excludes it.
+        not_fav = FilterRule("is_favorite", "is_false", "")
+        got2 = {
+            a.asset_id
+            for a in federation.list_filtered_assets(self.fed, None, [not_fav], [])
+        }
+        self.assertNotIn(aid, got2)
+        self.assertTrue(got2)  # the other assets remain
+
+        # Toggle off removes it from favorites.
+        federation.set_image_flag(self.fed, aid, imgdb.ATTR_IS_FAVORITE, False)
+        got3 = {
+            a.asset_id
+            for a in federation.list_filtered_assets(self.fed, None, [fav_rule], [])
+        }
+        self.assertEqual(got3, set())
+
     def test_dataset_info_ids_per_shard(self):
         # Same-named dataset in two shards → one merged DatasetInfo carrying a
         # distinct surrogate UUID per shard.

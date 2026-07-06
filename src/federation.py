@@ -52,6 +52,7 @@ UNION_TABLES: tuple[str, ...] = (
     "merged_assets",
     "datasets",
     "dataset_assets",
+    "image_attributes",
 )
 
 
@@ -651,6 +652,16 @@ def list_all_tag_types_federation(fed: Federation) -> list[str]:
                   MIN(created_at) ASC
     """).fetchall()
     return [r["name"] for r in rows] or ["General"]
+
+
+def set_image_flag(fed: Federation, asset_id: str, key: str, on: bool) -> None:
+    shard = shard_for_asset(fed, asset_id)
+    imgdb.set_image_flag(shard.conn, asset_id, key, on)
+
+
+def get_image_flag(fed: Federation, asset_id: str, key: str) -> bool:
+    shard = shard_for_asset(fed, asset_id)
+    return imgdb.get_image_flag(shard.conn, asset_id, key)
 
 
 def add_tags(

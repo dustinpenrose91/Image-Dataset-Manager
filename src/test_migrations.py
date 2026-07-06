@@ -106,6 +106,14 @@ class MigrateTests(unittest.TestCase):
                 "AND name='idx_datasets_dataset_id'"
             ).fetchone()
             self.assertIsNotNone(idx)
+            # New EAV table appears with no migration logic — just CREATE TABLE
+            # IF NOT EXISTS in SCHEMA_SQL. This is the pattern that lets future
+            # per-image data land without a schema migration.
+            tbl = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='image_attributes'"
+            ).fetchone()
+            self.assertIsNotNone(tbl)
             conn.close()
         finally:
             shutil.rmtree(root)

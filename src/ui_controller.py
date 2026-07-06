@@ -88,6 +88,13 @@ class AppController(QObject):
             )
         )
 
+    def set_favorite(self, asset_id: str, on: bool) -> None:
+        # Detail panel reflects the change optimistically, so no refresh signal;
+        # any active favorite filter reconciles on the next filter change.
+        self._submit(
+            lambda fed: federation.set_image_flag(fed, asset_id, imgdb.ATTR_IS_FAVORITE, on)
+        )
+
     def set_has_mask(self, abs_path: str, has_mask: bool) -> None:
         self._submit(lambda fed: federation.set_has_mask_by_abs_path(fed, abs_path, has_mask))
 
