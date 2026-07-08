@@ -112,13 +112,26 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("tags_changed", self.signals)
         self.assertNotIn("stale", self.signals)
 
-    def test_batch_add_tag_writes_without_signal(self):
+    def test_batch_add_tag_writes_and_refreshes(self):
         ids = self._ids()
         self.ctl.batch_add_tag(ids, ["x", "y"], "General")
         for aid in ids:
             self.assertEqual(self._tag_count(aid, "x"), 1)
             self.assertEqual(self._tag_count(aid, "y"), 1)
-        self.assertEqual(self.signals, [])
+        # Must emit tags_changed so the tag-management counts refresh.
+        self.assertIn("tags_changed", self.signals)
+
+    def test_batch_remove_and_replace_emit_tags_changed(self):
+        ids = self._ids()
+        federation.add_tags(self.fed, ids[0], ["old"])
+        self.signals.clear()
+        self.ctl.batch_remove_tag(ids, "old")
+        self.assertIn("tags_changed", self.signals)
+        self.signals.clear()
+        self.ctl.batch_add_tag(ids, ["a"], "General")
+        self.ctl.batch_replace_tag(ids, "a", "b")
+        self.assertIn("tags_changed", self.signals)
+        self.assertEqual(self._tag_count(ids[0], "b"), 1)
 
     def test_save_and_delete_caption(self):
         aid = self._ids()[0]

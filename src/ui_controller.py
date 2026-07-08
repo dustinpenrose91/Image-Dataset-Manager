@@ -101,21 +101,23 @@ class AppController(QObject):
     def set_perceptual_hash(self, abs_path: str, phash: str) -> None:
         self._submit(lambda fed: federation.set_perceptual_hash_by_abs_path(fed, abs_path, phash))
 
-    # -- batch tag edits (dialog-gathered; write-only, no refresh) ----------
+    # -- batch tag edits (dialog-gathered) ----------------------------------
+    # These change tag membership across many assets, so they emit tags_changed
+    # to refresh the suggestion list and the Tag Management panel's counts.
 
     def batch_add_tag(self, asset_ids: list[str], tags: list[str], type_name: str) -> None:
         def op(fed: federation.Federation) -> None:
             for tag in tags:
                 federation.add_tag_to_asset_ids(fed, asset_ids, tag, type_name)
 
-        self._submit(op)
+        self._submit(op, on_result=lambda _: self.tags_changed.emit())
 
     def batch_remove_tag(self, asset_ids: list[str], tag: str) -> None:
         def op(fed: federation.Federation) -> None:
             for asset_id in asset_ids:
                 federation.remove_tags_by_name(fed, asset_id, tag)
 
-        self._submit(op)
+        self._submit(op, on_result=lambda _: self.tags_changed.emit())
 
     def batch_replace_tag(self, asset_ids: list[str], old_tag: str, new_tag: str) -> None:
         def op(fed: federation.Federation) -> None:
@@ -123,7 +125,7 @@ class AppController(QObject):
                 federation.remove_tags_by_name(fed, asset_id, old_tag)
                 federation.add_tags(fed, asset_id, [new_tag])
 
-        self._submit(op)
+        self._submit(op, on_result=lambda _: self.tags_changed.emit())
 
     # -- tag-management operations (full tags_changed) ----------------------
 
