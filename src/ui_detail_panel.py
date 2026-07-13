@@ -204,6 +204,7 @@ class _TagsSection(QWidget):
         self._all_types: list[str] = ["General"]
         self._all_tags: list[tuple[str, str, int]] = []
         self._groups: dict[str, _TagGroup] = {}
+        self._pending_focus_type: Optional[str] = None
 
         self._groups_layout = QVBoxLayout()
         self._groups_layout.setContentsMargins(0, 0, 0, 0)
@@ -257,6 +258,15 @@ class _TagsSection(QWidget):
                 self._add_group(type_name, type_name == "General", rows=[], position=i)
             self._groups[type_name].load(by_type.get(type_name, []))
 
+        # Focus continuity: a group created by the add-category dialog gets
+        # focus so the user can keep typing tags without re-clicking.
+        # (Existing groups keep focus naturally because they are reused.)
+        if self._pending_focus_type:
+            grp = self._groups.get(self._pending_focus_type)
+            self._pending_focus_type = None
+            if grp:
+                QTimer.singleShot(0, grp.focus_input)
+
     def set_suggestions(self, tags: list[tuple[str, str, int]]) -> None:
         self._all_tags = tags
         for grp in self._groups.values():
@@ -285,6 +295,7 @@ class _TagsSection(QWidget):
         dlg = AddTagCategoryDialog(self._all_types, shown, self._all_tags, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        self._pending_focus_type = dlg.type_name()
         self.tag_added.emit(dlg.tag_name(), dlg.type_name())
 
 

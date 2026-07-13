@@ -83,6 +83,16 @@ ui_*.py           Individual UI panels and dialogs (asset table, detail panel,
 6. **No silent fallbacks.** Missing deps error at import. Conflicting label→path rebind errors.
 7. **Cross-shard writes are forbidden.** `merge` requires both assets in the same shard.
 
+## UI design principles (enforce these)
+
+A refresh must never discard user context. Any operation that reloads or rebuilds a view — adding/removing tags, deleting assets, dataset changes — preserves what the user had before it ran: focus, scroll position, and selection. When adding a new UI flow, check it against each principle below; when fixing a violation, fix the shared helper and audit every call site with the same shape.
+
+1. **Focus continuity.** After an action submitted from a text input (tag, category, caption, dataset name), focus ends up in the input the user would type into next — never dropped on a button or nowhere. Two established mechanisms in `ui_detail_panel.py`:
+   - *Widget reuse:* `_TagsSection.load_tags` and `_TagGroup.load` reuse existing widgets across reloads (groups by type, chips by diff), so a reused input keeps focus for free. Prefer reuse over rebuild.
+   - *Deferred focus for new widgets:* when the reload itself creates the widget (async DB round-trip), record the intent before emitting (`_TagsSection._pending_focus_type`) and apply focus when the rebuild lands.
+2. **Scroll and selection preservation.** When rows disappear or the table refreshes in place (deletion, removal from the selected dataset, tag/caption edits), the refresh goes through `_apply_filter_preserving_scroll` and `_auto_select_after_refresh` in `imgdb_ui.py` — controller intents signal this via `assets_changed(preserve_scroll=True)`. Plain `_apply_filter` resets the viewport and is only for genuinely new result sets (changed filter rules).
+3. **Defer past Qt's follow-up passes.** Focus and scrollbar writes issued during a model reset, reload, or dialog close get clobbered by Qt's subsequent layout pass (and `QCompleter`'s activated hook). Apply them via `QTimer.singleShot(0, ...)` after the completion signal — see `_apply_filter_preserving_scroll` and `_TagInput._submit`.
+
 ## Key patterns
 
 **Transactions:** always use `imgdb.transaction(conn)` (an `@contextmanager` that issues `BEGIN IMMEDIATE` and rolls back on exception). Connections are opened with `isolation_level=None` (autocommit) so explicit `BEGIN` and sqlite3's implicit transaction control don't collide.
