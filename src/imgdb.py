@@ -26,6 +26,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional
 
@@ -346,6 +347,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "UPDATE datasets SET dataset_id = ? WHERE name = ?",
             (str(uuid.uuid4()), row["name"]),
         )
+    # Drop the retired is_last_scan flag. It carried no timestamp, so there is
+    # nothing to convert into scan_at; the next scan starts the new history.
+    # Guarded: _migrate also runs against schemas predating image_attributes.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='image_attributes'"
+    ).fetchone():
+        conn.execute("DELETE FROM image_attributes WHERE key = 'is_last_scan'")
 
 
 def init_shard(root_abs_path: str) -> sqlite3.Connection:
@@ -654,7 +662,7 @@ def scan_root(
             """
         )
         summary.missing = cur.rowcount or 0
-        _mark_last_scan(conn, new_ids)
+        _record_scan_time(conn, new_ids)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -796,7 +804,7 @@ def scan_root_finish(
                 """
             )
             session.summary.missing = cur.rowcount or 0
-            _mark_last_scan(conn, session.new_ids)
+            _record_scan_time(conn, session.new_ids)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -810,16 +818,19 @@ def scan_root_finish(
     return session.summary, session.new_ids
 
 
-def _mark_last_scan(conn: sqlite3.Connection, new_ids: list[str]) -> None:
-    """Flag exactly the assets added by the just-completed scan as
-    is_last_scan, clearing the flag from everything else in this shard. Runs
-    inside the scan's final transaction (no BEGIN of its own)."""
-    conn.execute(
-        "DELETE FROM image_attributes WHERE key = ?", (ATTR_IS_LAST_SCAN,)
-    )
+def _record_scan_time(conn: sqlite3.Connection, new_ids: list[str]) -> None:
+    """Stamp exactly the assets added by the just-completed scan with the
+    scan's timestamp — one shared value for the whole batch, so a scan is
+    addressable as a group (sort by it, filter `scan_at >= ...`). Earlier
+    scans' stamps are left alone; the history accumulates. Runs inside the
+    scan's final transaction (no BEGIN of its own)."""
+    if not new_ids:
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     conn.executemany(
-        "INSERT INTO image_attributes(asset_id, key, value) VALUES (?, ?, '1')",
-        [(aid, ATTR_IS_LAST_SCAN) for aid in new_ids],
+        "INSERT OR REPLACE INTO image_attributes(asset_id, key, value)"
+        " VALUES (?, ?, ?)",
+        [(aid, ATTR_SCAN_AT, ts) for aid in new_ids],
     )
 
 
@@ -1101,7 +1112,9 @@ def set_has_mask(conn: sqlite3.Connection, asset_id: str, has_mask: bool) -> Non
 
 # Well-known attribute keys. New keys can be added freely without a migration.
 ATTR_IS_FAVORITE = "is_favorite"
-ATTR_IS_LAST_SCAN = "is_last_scan"
+# Timestamp ('YYYY-MM-DD HH:MM:SS', UTC) shared by every asset a single scan
+# added. Sortable and range-filterable; supersedes the old is_last_scan flag.
+ATTR_SCAN_AT = "scan_at"
 
 
 def set_image_attribute(

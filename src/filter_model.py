@@ -30,7 +30,9 @@ class FilterField:
 class SortField:
     id: str
     display_name: str
-    sql_col: str          # bare column name (no alias needed in ORDER BY)
+    # Bare column name, or any SQL expression using {alias} for the assets
+    # table alias (substituted at build time, as in FilterField.sql_expr).
+    sql_expr: str
 
 
 @dataclass
@@ -52,6 +54,12 @@ DTYPE_OPS: dict[str, list[tuple[str, str]]] = {
                 ("contains", "contains"), ("starts_with", "starts with")],
     "integer": [("=", "="), ("!=", "≠"), (">", ">"), ("<", "<"),
                 (">=", "≥"), ("<=", "≤")],
+    # ISO-8601 strings compare lexicographically, so the integer operator set
+    # works verbatim; values bind as text.
+    "timestamp": [("=", "on"), ("!=", "not on"),
+                  (">", "after"), ("<", "before"),
+                  (">=", "on or after"), ("<=", "on or before"),
+                  ("starts_with", "starts with"), ("contains", "contains")],
     "boolean": [("is_true", "is true"), ("is_false", "is false")],
     "tag":     [("has", "has tag"), ("not_has", "does not have tag")],
     "dataset": [("is_in", "is in dataset"), ("not_in", "not in dataset")],
@@ -73,9 +81,11 @@ FILTER_FIELDS: dict[str, FilterField] = {
         FilterField("is_favorite",   "Favorite",              "boolean",
             "(SELECT 1 FROM all_image_attributes"
             " WHERE asset_id = {alias}.asset_id AND key = 'is_favorite' AND value = '1')"),
-        FilterField("is_last_scan",  "New in last scan",      "boolean",
-            "(SELECT 1 FROM all_image_attributes"
-            " WHERE asset_id = {alias}.asset_id AND key = 'is_last_scan' AND value = '1')"),
+        # EAV-backed timestamp: one shared value per scan batch (see
+        # imgdb.ATTR_SCAN_AT). ISO-8601 sorts and compares lexicographically.
+        FilterField("scan_at",       "Scanned at",            "timestamp",
+            "(SELECT value FROM all_image_attributes"
+            " WHERE asset_id = {alias}.asset_id AND key = 'scan_at')"),
         FilterField("tag_count",     "Tag count",             "integer",
             "(SELECT COUNT(*) FROM all_asset_tags WHERE asset_id = {alias}.asset_id)"),
         FilterField("caption_count", "Caption count",         "integer",
@@ -110,6 +120,9 @@ SORTABLE_FIELDS: dict[str, SortField] = {
         SortField("created_at",   "Created",      "created_at"),
         SortField("updated_at",   "Updated",      "updated_at"),
         SortField("last_seen",    "Last seen",    "last_seen"),
+        SortField("scan_at",      "Scanned at",
+            "(SELECT value FROM all_image_attributes"
+            " WHERE asset_id = {alias}.asset_id AND key = 'scan_at')"),
     ]
 }
 
@@ -148,7 +161,7 @@ def build_filter_conditions(
             else:
                 conditions.append(f"COALESCE({expr}, 0) != 1")
 
-        elif field.dtype in ("text", "integer"):
+        elif field.dtype in ("text", "integer", "timestamp"):
             expr = field.sql_expr.replace("{alias}", alias)
             if rule.op == "contains":
                 conditions.append(f"{expr} LIKE ?")
@@ -194,7 +207,7 @@ def build_filter_conditions(
     return conditions, params
 
 
-def build_sort_clause(rules: list[SortRule]) -> str:
+def build_sort_clause(rules: list[SortRule], alias: str = "a") -> str:
     """
     Convert SortRules to the fragment that follows ORDER BY (no keyword).
     Always appends asset_id ASC as a deterministic tiebreaker.
@@ -206,6 +219,7 @@ def build_sort_clause(rules: list[SortRule]) -> str:
         if field is None or field.id in seen:
             continue
         seen.add(field.id)
-        parts.append(f"{field.sql_col} {'DESC' if rule.desc else 'ASC'}")
+        expr = field.sql_expr.replace("{alias}", alias)
+        parts.append(f"{expr} {'DESC' if rule.desc else 'ASC'}")
     parts.append("asset_id ASC")
     return ", ".join(parts)

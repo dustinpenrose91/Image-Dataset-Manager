@@ -992,7 +992,7 @@ def list_filtered_assets(
     if conditions == ["1=0"]:
         return
 
-    order = build_sort_clause(sort_rules)
+    order = build_sort_clause(sort_rules, alias="a")
     sql_parts = [
         "SELECT a.asset_id, a._root, a.rel_path, a.bytes, a.width, a.height,"
         "       a.format, a.exists_flag, a.perceptual_hash",

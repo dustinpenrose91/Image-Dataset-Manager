@@ -187,9 +187,13 @@ class _SortRow(QWidget):
 
         self._field_cb = QComboBox()
         for fid, sf in SORTABLE_FIELDS.items():
-            # Show both display name and SQL column name so users can reference
-            # the column in custom SQL filters.
-            self._field_cb.addItem(f"{sf.display_name}  ({sf.sql_col})", fid)
+            # Show the SQL column name alongside the display name so users can
+            # reference it in custom SQL filters. Expression-backed fields
+            # (subqueries) have no column to name, so show the label alone.
+            label = sf.display_name
+            if sf.sql_expr.isidentifier():
+                label = f"{label}  ({sf.sql_expr})"
+            self._field_cb.addItem(label, fid)
         idx = self._field_cb.findData(rule.field_id)
         if idx >= 0:
             self._field_cb.setCurrentIndex(idx)

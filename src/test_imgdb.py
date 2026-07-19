@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime
 
 from PIL import Image
 
@@ -568,9 +569,9 @@ class ImageAttributeTests(unittest.TestCase):
         _img(os.path.join(self.root, "a.png"))
         _, ids = scan_root(self.conn, self.root)
         self.aid = ids[0]
-        # scan_root flags the new asset is_last_scan; clear it so these tests
+        # scan_root stamps the new asset with scan_at; clear it so these tests
         # observe only the attributes they set.
-        imgdb.delete_image_attribute(self.conn, self.aid, imgdb.ATTR_IS_LAST_SCAN)
+        imgdb.delete_image_attribute(self.conn, self.aid, imgdb.ATTR_SCAN_AT)
 
     def tearDown(self):
         self.conn.close()
@@ -610,7 +611,9 @@ class ImageAttributeTests(unittest.TestCase):
         self.assertEqual(n, 0)
 
 
-class LastScanFlagTests(unittest.TestCase):
+class ScanTimestampTests(unittest.TestCase):
+    """scan_at: one shared timestamp per scan batch, and prior batches keep
+    the stamp they were given."""
 
     def setUp(self):
         self.root = tempfile.mkdtemp()
@@ -623,41 +626,50 @@ class LastScanFlagTests(unittest.TestCase):
     def _put(self, rel: str, color=(0, 0, 0)) -> None:
         _img(os.path.join(self.root, rel), color=color)
 
-    def _flag(self, aid: str) -> bool:
-        return imgdb.get_image_flag(self.conn, aid, imgdb.ATTR_IS_LAST_SCAN)
+    def _scan_at(self, aid: str):
+        return imgdb.get_image_attribute(self.conn, aid, imgdb.ATTR_SCAN_AT)
 
     def _id_for(self, rel: str) -> str:
         return self.conn.execute(
             "SELECT asset_id FROM assets WHERE rel_path = ?", (rel,)
         ).fetchone()["asset_id"]
 
-    def test_new_assets_flagged_and_recleared_next_scan(self):
+    def test_batch_shares_one_timestamp_and_history_persists(self):
         self._put("a.png"); self._put("b.png")
         scan_root(self.conn, self.root)
         a, b = self._id_for("a.png"), self._id_for("b.png")
-        self.assertTrue(self._flag(a))
-        self.assertTrue(self._flag(b))
+        first = self._scan_at(a)
+        self.assertTrue(first)
+        self.assertEqual(self._scan_at(b), first)
 
-        # Next scan adds c.png: only c is flagged; a and b cleared.
+        # A later scan stamps only its own new assets and leaves a/b alone.
         self._put("c.png", color=(9, 9, 9))
         scan_root(self.conn, self.root)
         c = self._id_for("c.png")
-        self.assertTrue(self._flag(c))
-        self.assertFalse(self._flag(a))
-        self.assertFalse(self._flag(b))
+        self.assertTrue(self._scan_at(c))
+        self.assertEqual(self._scan_at(a), first)
+        self.assertEqual(self._scan_at(b), first)
 
-    def test_incremental_scan_flags_new(self):
+    def test_timestamp_format_sorts_lexicographically(self):
+        self._put("a.png")
+        scan_root(self.conn, self.root)
+        ts = self._scan_at(self._id_for("a.png"))
+        # Parses as the same 'YYYY-MM-DD HH:MM:SS' shape used by created_at.
+        datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+
+    def test_incremental_scan_stamps_new_only(self):
         self._put("a.png")
         scan_root(self.conn, self.root)
         a = self._id_for("a.png")
+        first = self._scan_at(a)
         self._put("b.png", color=(5, 5, 5))
         session = imgdb.scan_root_init(self.conn, self.root)
         while not imgdb.scan_root_batch(self.conn, session):
             pass
         imgdb.scan_root_finish(self.conn, session)
         b = self._id_for("b.png")
-        self.assertTrue(self._flag(b))
-        self.assertFalse(self._flag(a))
+        self.assertTrue(self._scan_at(b))
+        self.assertEqual(self._scan_at(a), first)
 
 
 class DatasetIdTests(unittest.TestCase):
