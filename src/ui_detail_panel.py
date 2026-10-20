@@ -5,6 +5,9 @@ currently selected asset, plus batch-action UI when multiple assets are selected
 Single-asset state:  full thumbnail + metadata + tag chips + caption editors
 Multi-asset state:   asset count + batch [Add tag…] / [Delete…] buttons
 Empty state:         placeholder text
+
+One AutoCaptionPanel is shared by the single and multi views: load_selection
+reparents it into whichever view is shown, so its settings never diverge.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ import imgdb
 import imgdb_thumbs
 from imgdb_thumbs_qt import QtThumbnailBridge
 from imgdb_worker_qt import QtDBBridge
+from ui_autocaption import AutoCaptionPanel
 from ui_dialogs import (
     AddCaptionDialog, AddTagCategoryDialog, AddToDatasetDialog, BatchMoveDialog,
     BatchRemoveTagDialog, BatchReplaceTagDialog, BatchTagDialog,
@@ -350,6 +354,10 @@ class _CaptionBlock(QWidget):
         self._original = content
         self._editor.setPlainText(content)
 
+    def is_dirty(self) -> bool:
+        """True while the editor holds unsaved user edits."""
+        return self._editor.toPlainText() != self._original
+
     def set_state(self, content: str, is_validated: bool) -> None:
         """Reuse this block for another asset's caption of the same kind, without
         emitting validated_changed for the programmatic checkbox update."""
@@ -503,6 +511,10 @@ class _SingleDetail(QWidget):
         cl.addWidget(captions_header)
         cl.addLayout(self._captions_container)
         cl.addWidget(add_caption_btn)
+        # DetailPanel parks the shared AutoCaptionPanel here when single-select.
+        self.autocaption_slot = QVBoxLayout()
+        self.autocaption_slot.setContentsMargins(0, 0, 0, 0)
+        cl.addLayout(self.autocaption_slot)
         cl.addWidget(sep3)
         cl.addLayout(actions_row)
         cl.addWidget(merge_btn)
@@ -580,8 +592,21 @@ class _SingleDetail(QWidget):
         if self._asset and self._asset.asset_id == asset_id:
             self._thumb_label.set_source_pixmap(pixmap)
 
-    def _load_tags_and_captions(self, asset: federation.AssetRow) -> None:
-        """Full bundle reload — used on selection change (one worker round-trip)."""
+    def refresh_captions(self, asset_id: str) -> None:
+        """Re-fetch after an external caption write (auto-caption) if this asset
+        is showing. Blocks the user is mid-edit in keep their text."""
+        if self._asset is not None and self._asset.asset_id == asset_id:
+            self._load_tags_and_captions(self._asset, keep_dirty=True)
+
+    def _load_tags_and_captions(
+        self, asset: federation.AssetRow, keep_dirty: bool = False,
+    ) -> None:
+        """Full bundle reload — used on selection change (one worker round-trip).
+
+        keep_dirty: leave caption editors with unsaved edits untouched. Only
+        for refreshes of the same asset — on asset switch a reused block must
+        always take the new asset's content.
+        """
         aid = asset.asset_id
         root = asset.root
 
@@ -603,7 +628,7 @@ class _SingleDetail(QWidget):
             tag_rows, caps, all_types, datasets, tags_validated, is_favorite = data
             self._rebuild_tags(tag_rows, all_types)
             self._tags_validated_cb.setChecked(tags_validated)
-            self._rebuild_captions(caps)
+            self._rebuild_captions(caps, keep_dirty)
             self._load_datasets(datasets)
             self._apply_favorite_state(is_favorite)
 
@@ -659,7 +684,9 @@ class _SingleDetail(QWidget):
     def _rebuild_tags(self, tag_rows: list, all_types: list[str]) -> None:
         self._tags_section.load_tags(tag_rows, all_types)
 
-    def _rebuild_captions(self, caps: dict[str, tuple[str, bool]]) -> None:
+    def _rebuild_captions(
+        self, caps: dict[str, tuple[str, bool]], keep_dirty: bool = False,
+    ) -> None:
         # Diff by kind: reuse an existing block for the same kind (update content
         # + validated in place), add blocks for new kinds, drop blocks for gone
         # kinds. Avoids tearing down every editor when the kind set is unchanged.
@@ -679,7 +706,7 @@ class _SingleDetail(QWidget):
                 block.validated_changed.connect(self._on_caption_validated_toggled)
                 self._captions_container.addWidget(block)
                 self._caption_blocks[kind] = block
-            else:
+            elif not (keep_dirty and block.is_dirty()):
                 block.set_state(content, is_validated)
 
     def _add_tag(self, name: str, type_name: str) -> None:
@@ -838,6 +865,11 @@ class _MultiDetail(QWidget):
         layout.addWidget(self._remove_from_dataset_btn)
         layout.addWidget(delete_btn)
         layout.addWidget(self._merge_btn)
+        layout.addWidget(_sep())
+        # DetailPanel parks the shared AutoCaptionPanel here when multi-select.
+        self.autocaption_slot = QVBoxLayout()
+        self.autocaption_slot.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self.autocaption_slot)
         layout.addStretch()
 
     def load_assets(self, assets: list[federation.AssetRow]) -> None:
@@ -895,6 +927,7 @@ class DetailPanel(QWidget):
     batch_add_to_dataset_requested = Signal(list)        # list[AssetRow]
     batch_remove_from_dataset_requested = Signal(list)   # list[AssetRow]
     merge_two_requested = Signal(list)
+    autocaption_requested = Signal(list, object)        # asset_ids, AutoCaptionRequest
 
     def __init__(
         self,
@@ -904,7 +937,16 @@ class DetailPanel(QWidget):
     ) -> None:
         super().__init__(parent)
         self._bridge = bridge
+        self._selected_ids: list[str] = []
+        self._autocaption_host: Optional[QWidget] = None
         self.setMinimumWidth(180)
+
+        # Shared between the single and multi views; MainWindow wires its
+        # other signals (cancel/unload/manage prompts/settings) directly.
+        self.autocaption = AutoCaptionPanel()
+        self.autocaption.generate_requested.connect(
+            lambda req: self.autocaption_requested.emit(list(self._selected_ids), req)
+        )
 
         self._empty = QLabel("Select an asset\nto see details.")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -960,9 +1002,15 @@ class DetailPanel(QWidget):
         assets: list[federation.AssetRow],
         fed: Optional[federation.Federation],
     ) -> None:
+        self._selected_ids = [a.asset_id for a in assets]
+        self.autocaption.set_target_count(len(assets))
         if not assets:
             self._stack.setCurrentIndex(0)
             return
+        view = self._single if len(assets) == 1 else self._multi
+        if self._autocaption_host is not view:
+            view.autocaption_slot.addWidget(self.autocaption)  # reparents
+            self._autocaption_host = view
         if len(assets) == 1:
             asset = assets[0]
             root_abs = fed.shards[asset.root].abs_path if (
@@ -973,6 +1021,9 @@ class DetailPanel(QWidget):
         else:
             self._multi.load_assets(assets)
             self._stack.setCurrentIndex(2)
+
+    def refresh_captions(self, asset_id: str) -> None:
+        self._single.refresh_captions(asset_id)
 
 
 # ---------------------------------------------------------------------------

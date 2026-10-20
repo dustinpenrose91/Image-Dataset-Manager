@@ -19,6 +19,7 @@ counts and thumbnail-queue depth.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Optional
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QStackedWidget, QStatusBar, QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
+import captioner
 import federation
 import imgdb
 import imgdb_thumbs
@@ -38,7 +40,8 @@ from filter_model import FilterRule, SortRule
 from imgdb_thumbs_qt import QtThumbnailBridge
 from imgdb_worker import DBWorker
 from imgdb_worker_qt import QtDBBridge
-from ui_controller import AppController
+from ui_autocaption import PromptManagerDialog
+from ui_controller import AppController, AutoCaptionController
 from ui_asset_table import AssetTableModel, AssetTableView
 from ui_detail_panel import DetailPanel
 from ui_filter_panel import FilterPanel
@@ -125,6 +128,18 @@ class MainWindow(QMainWindow):
         self._compute_worker = DBWorker()
         self._compute_worker.start(lambda: None)
         self._compute_bridge = QtDBBridge(self._compute_worker)
+
+        # Caption worker: also federation-less. Its jobs block on HTTP calls to
+        # the llama-server subprocess, so it is kept separate from the compute
+        # worker (a long caption run must not stall perceptual-hash backfill).
+        # The LlamaServer is only touched from this thread (and at shutdown).
+        self._cap_dir = captioner.captioning_dir(self._config_path)
+        self._llama = captioner.LlamaServer(captioner.server_bin(self._cap_dir))
+        self._caption_worker = DBWorker()
+        self._caption_worker.start(lambda: None)
+        self._autocap = AutoCaptionController(
+            self._bridge, QtDBBridge(self._caption_worker), self._llama, self
+        )
 
     def _on_shard_warning(self, msg: str) -> None:
         # May fire before _build_ui() has created the status bar (e.g. during
@@ -226,6 +241,21 @@ class MainWindow(QMainWindow):
         worker_inner_layout.addWidget(self._backfill_cb)
         worker_inner_layout.addLayout(batch_row)
         config_layout.addWidget(worker_inner)
+
+        autocap_header = QLabel("Auto-caption")
+        autocap_header.setStyleSheet("font-weight: bold; padding: 6px 4px 2px 4px;")
+        config_layout.addWidget(autocap_header)
+        self._manage_prompts_btn = QPushButton("Manage caption prompts…")
+        self._manage_prompts_btn.setToolTip(
+            "Create, edit, rename and delete prompt presets\n"
+            f"(stored in {captioner.prompts_dir(self._cap_dir)})"
+        )
+        autocap_inner = QWidget()
+        autocap_inner_layout = QHBoxLayout(autocap_inner)
+        autocap_inner_layout.setContentsMargins(4, 0, 4, 4)
+        autocap_inner_layout.addWidget(self._manage_prompts_btn)
+        autocap_inner_layout.addStretch()
+        config_layout.addWidget(autocap_inner)
 
         self._left_tabs.addTab(config_widget, "Config")
 
@@ -341,6 +371,23 @@ class MainWindow(QMainWindow):
         self._backfill_cb.toggled.connect(lambda _: self._save_settings())
         self._batch_size_spin.valueChanged.connect(lambda _: self._save_settings())
 
+        # Auto-caption
+        ac = self._detail_panel.autocaption
+        dp.autocaption_requested.connect(self._autocap.enqueue)
+        ac.cancel_requested.connect(self._autocap.cancel)
+        ac.unload_requested.connect(self._autocap.unload)
+        ac.manage_prompts_requested.connect(self._manage_prompts)
+        ac.settings_changed.connect(self._save_autocaption_settings)
+        self._manage_prompts_btn.clicked.connect(self._manage_prompts)
+        self._autocap.error.connect(self._show_error)
+        self._autocap.model_state_changed.connect(ac.set_model_state)
+        self._autocap.running_changed.connect(ac.set_running)
+        self._autocap.progress.connect(self._on_autocaption_progress)
+        self._autocap.caption_written.connect(
+            lambda asset_id, _kind: self._detail_panel.refresh_captions(asset_id)
+        )
+        self._autocap.finished.connect(self._on_autocaption_finished)
+
         # Query tab — save result as dataset
         self._query_tab.save_as_dataset_requested.connect(self._save_as_dataset)
 
@@ -363,6 +410,7 @@ class MainWindow(QMainWindow):
             self._apply_filter()
             self._refresh_datasets()
             self._refresh_tag_suggestions()
+            self._refresh_caption_kinds()
             self._repair_has_mask()
             self._start_phash_backfill()
 
@@ -387,6 +435,7 @@ class MainWindow(QMainWindow):
             self._apply_filter()
             self._refresh_datasets()
             self._refresh_tag_suggestions()
+            self._refresh_caption_kinds()
             self._repair_has_mask()
             self._start_phash_backfill()
 
@@ -1262,6 +1311,79 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", str(exc))
 
     # -----------------------------------------------------------------------
+    # Auto-caption
+    # -----------------------------------------------------------------------
+
+    def _load_captioning(self) -> None:
+        """Discover models and prompt presets under captioning/ and restore the
+        panel's last-used settings. Malformed model directories are reported
+        in a warning, never skipped silently."""
+        specs, problems = captioner.discover_models(self._cap_dir)
+        if problems:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self, "Auto-caption models",
+                "Some model directories were skipped:\n\n" + "\n\n".join(problems),
+            ))
+        self._autocap.set_models(specs)
+        ac = self._detail_panel.autocaption
+        ac.set_models(specs)
+        ac.set_presets(self._read_prompt_presets())
+        raw = self._settings().value("autocaption/state", "")
+        try:
+            state = json.loads(raw) if raw else {}
+        except ValueError:
+            state = {}
+        ac.restore_state(state)
+
+    def _read_prompt_presets(self) -> dict[str, str]:
+        try:
+            return captioner.list_prompts(captioner.prompts_dir(self._cap_dir))
+        except OSError as e:
+            self._show_error(e)
+            return {}
+
+    def _manage_prompts(self) -> None:
+        ac = self._detail_panel.autocaption
+        dlg = PromptManagerDialog(
+            captioner.prompts_dir(self._cap_dir), select=ac.state()["preset"], parent=self
+        )
+        dlg.exec()
+        ac.set_presets(self._read_prompt_presets())
+
+    def _save_autocaption_settings(self) -> None:
+        self._settings().setValue(
+            "autocaption/state", json.dumps(self._detail_panel.autocaption.state())
+        )
+
+    def _refresh_caption_kinds(self) -> None:
+        self._bridge.submit(
+            federation.list_all_caption_kinds,
+            on_result=self._detail_panel.autocaption.set_caption_kinds,
+            on_error=self._show_error,
+        )
+
+    def _on_autocaption_progress(self, done: int, total: int, name: str) -> None:
+        self._detail_panel.autocaption.set_progress(done, total, name)
+        if name:
+            self._status_bar.showMessage(f"Auto-captioning {done + 1} / {total} — {name}")
+
+    def _on_autocaption_finished(
+        self, written: int, skipped: int, failed: int, cancelled: bool,
+    ) -> None:
+        parts = [f"{written} written"]
+        if skipped:
+            parts.append(f"{skipped} skipped (caption exists)")
+        if failed:
+            parts.append(f"{failed} failed — see log")
+        verb = "cancelled" if cancelled else "complete"
+        self._status_bar.showMessage(f"Auto-caption {verb}: " + ", ".join(parts), 10000)
+        if written:
+            # caption_count filters / new kinds may have changed; refresh once
+            # per run (not per image) without losing the user's place.
+            self._refresh_caption_kinds()
+            self._on_assets_changed(True)
+
+    # -----------------------------------------------------------------------
     # Shutdown
     # -----------------------------------------------------------------------
 
@@ -1296,10 +1418,15 @@ class MainWindow(QMainWindow):
         self._backfill_cb.setChecked(backfill)
         batch = s.value("worker/batch_size", defaultValue=50, type=int)
         self._batch_size_spin.setValue(batch)
+        self._load_captioning()
 
     def closeEvent(self, event) -> None:
         self._save_settings()
         self._poll_timer.stop()
+        # Kill the server first so an in-flight generation fails fast and the
+        # caption worker can exit promptly.
+        self._llama.shutdown()
+        self._caption_worker.shutdown(timeout=10)
         if self._compute_worker:
             self._compute_worker.shutdown(timeout=10)
         if self._bridge and self._worker:

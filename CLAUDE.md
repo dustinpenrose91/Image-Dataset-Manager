@@ -50,6 +50,10 @@ imgdb_worker.py   Toolkit-agnostic DB worker. Wraps a Federation in a single
                   background thread with a FIFO job queue. SQLite connections
                   are created on the worker thread and never crossed.
 
+captioner.py      Toolkit-agnostic auto-caption backend. Model discovery,
+                  prompt-preset store, image encoding, and LlamaServer (a
+                  managed llama.cpp `llama-server` subprocess). No Qt imports.
+
 imgdb_worker_qt.py / imgdb_thumbs_qt.py
                   Qt adapters only. Marshal callbacks from worker threads to
                   Qt signals on the main thread. No business logic.
@@ -59,6 +63,7 @@ ui_controller.py  AppController — widget-free QObject owning DB-write
                   (add_tag, save_caption, rename_asset, …) and emits change
                   signals (error, tag_suggestions_stale, tags_changed,
                   assets_changed, datasets_changed). No widget imports.
+                  Also AutoCaptionController — the auto-caption queue.
 
 ui_flows.py       Multi-step UI flows that interleave worker jobs with dialogs
                   (CaptionImportFlow). State on the instance, one method per step.
@@ -68,10 +73,13 @@ imgdb_ui.py       Main window. Constructs widgets, wires panel signals →
                   slots, and keeps refresh policy. No SQL, minimal logic.
 
 ui_*.py           Individual UI panels and dialogs (asset table, detail panel,
-                  roots panel, filter panel, query tab, dialogs, preview window).
+                  roots panel, filter panel, query tab, dialogs, preview window,
+                  auto-caption panel + prompt manager in ui_autocaption.py).
 ```
 
 `imgdb.conf` (INI format) maps root labels to absolute paths. It lives next to the entry point — not in `~/.config` or anywhere else.
+
+`captioning/` (git-ignored) sits next to `imgdb.conf` and holds everything auto-captioning needs: `llama.cpp/` (prebuilt CUDA binaries incl. `llama-server`), `models/<Display Name>/` (one model `.gguf` + one `*mmproj*.gguf`, optional `model.ini` with `[model] max_pixels`), and `prompts/<name>.txt` (prompt presets).
 
 ## Design invariants (enforce these)
 
@@ -104,6 +112,8 @@ A refresh must never discard user context. Any operation that reloads or rebuild
 **Worker thread ownership:** `DBWorker` and `ThumbnailWorker` create their SQLite connections inside the worker thread. Never pass connections across threads.
 
 **Compute worker (perceptual-hash backfill):** image decode+DCT must not run on the DB worker — it would block every UI read for the batch duration. `MainWindow` runs a second `DBWorker` started with a null factory (`lambda: None`, no federation) purely as a CPU thread. The backfill pipelines across three hops so reads stay responsive: DB worker fetches `(asset_id, label, abs_path)` → compute worker decodes → DB worker writes via `set_perceptual_hash`. Compute jobs only read files off disk; they never touch a SQLite connection.
+
+**Auto-captioning:** generation runs in a `llama-server` subprocess (`captioner.LlamaServer`) that stays loaded between runs until the user clicks Unload, switches model, or quits — no ML deps in the app, and a model crash can't take the UI down. `--device CUDA0` is passed explicitly because llama.cpp otherwise falls back to CPU silently when its CUDA backend fails to load. `MainWindow` runs a third federation-less `DBWorker` (the *caption worker*) whose jobs block on HTTP to the server; only that thread touches `LlamaServer` (plus `shutdown()` at exit). `AutoCaptionController` pipelines each asset across three hops — DB worker resolves path + existing-caption check → caption worker loads/generates → DB worker writes via `federation.set_caption` — and starts the next asset only after the write, so the DB worker never waits on generation. `ImageError` fails one asset and continues; `ServerError` aborts the run. Images are resized client-side to `max_pixels` (Pillow, EXIF-transposed, sent as PNG), so image size is per-request, not a server flag. `discover_models` returns `(specs, problems)`: a malformed model dir is reported in a warning but never hides the valid ones. One `AutoCaptionPanel` instance is shared by the single- and multi-select views (`DetailPanel.load_selection` reparents it into the visible view's `autocaption_slot`), so settings never diverge; its state persists as JSON under `autocaption/state` in `imgdb_ui.ini`. When a generated caption lands for the shown asset, `refresh_captions` reloads with `keep_dirty=True` so a caption block the user is mid-edit in keeps their text (never use `keep_dirty` on asset switch — a reused block must take the new asset's content). The table refreshes once per run (`assets_changed(True)` path), not per image.
 
 **Logging:** worker modules acquire `logging.getLogger(__name__)` and log (never silently swallow) failed jobs and raising `on_result`/`on_error` callbacks, while keeping the worker loop alive. Only the entry point (`imgdb_ui.main`) configures a handler; library modules never add handlers.
 
