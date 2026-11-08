@@ -343,6 +343,7 @@ class MainWindow(QMainWindow):
         dp.batch_remove_from_dataset_requested.connect(self._batch_remove_from_dataset)
         dp.merge_two_requested.connect(self._merge_two)
         dp.import_from_caption_requested.connect(self._import_from_caption)
+        dp.batch_import_from_caption_requested.connect(self._batch_import_from_caption)
 
         # Tag management panel
         tp = self._tag_panel
@@ -749,7 +750,7 @@ class MainWindow(QMainWindow):
                 f"Perceptual hash backfill complete ({done:,} computed)", 5000
             )
 
-    def _import_from_caption(self, asset_id: str) -> None:
+    def _new_caption_flow(self) -> CaptionImportFlow:
         # Held on self so the flow object outlives its in-flight worker jobs.
         self._caption_flow = CaptionImportFlow(
             bridge=self._bridge,
@@ -759,7 +760,13 @@ class MainWindow(QMainWindow):
             on_tags_changed=self._on_tags_changed,
             on_error=self._show_error,
         )
-        self._caption_flow.start(asset_id)
+        return self._caption_flow
+
+    def _import_from_caption(self, asset_id: str) -> None:
+        self._new_caption_flow().start(asset_id)
+
+    def _batch_import_from_caption(self, asset_ids: list[str]) -> None:
+        self._new_caption_flow().start_selection(asset_ids)
 
     def _rename_asset(self, asset_id: str, current_rel_path: str) -> None:
         dlg = RenameDialog(current_rel_path, self)

@@ -4,7 +4,7 @@ ui_flows — multi-step UI flows that interleave worker jobs with dialogs.
 `CaptionImportFlow` is the "Import tags from caption" flow, previously a single
 115-line method of nested closures in imgdb_ui.py. Each step is a named method
 and all shared state lives on the instance, so the fetch → dialog →
-single/bulk → prescan → resolve → import sequence reads top-to-bottom.
+single/selection/bulk → prescan → resolve → import sequence reads top-to-bottom.
 
 The flow needs a parent widget (dialogs are modal children of it), the DB
 bridge, and two callbacks supplied by the main window: `on_tags_changed`
@@ -39,6 +39,7 @@ class CaptionImportFlow:
         self._on_error = on_error
 
         self._asset_id: str = ""
+        self._selection: Optional[list[str]] = None
         self._tag_lookup: dict = {}
         self._caption_kind: Optional[str] = None
         self._bulk_kwargs: dict = {}
@@ -46,6 +47,14 @@ class CaptionImportFlow:
     def start(self, asset_id: str) -> None:
         self._asset_id = asset_id
         self._bridge.submit(self._fetch, on_result=self._show_dialog, on_error=self._on_error)
+
+    def start_selection(self, asset_ids: list[str]) -> None:
+        """Multi-image entry point: compact config popup, no per-image preview."""
+        self._selection = list(asset_ids)
+        self._bridge.submit(
+            self._fetch_selection, on_result=self._show_selection_dialog,
+            on_error=self._on_error,
+        )
 
     # -- step 1: gather the asset's captions + scope counts on the worker ----
 
@@ -62,7 +71,44 @@ class CaptionImportFlow:
         total_count = federation.count_filtered_assets(fed, self._checked, [])
         return tag_lookup, caption_texts, all_kinds, filtered_count, total_count
 
+    def _fetch_selection(self, fed: federation.Federation) -> tuple:
+        tag_lookup = federation.build_tag_lookup(fed)
+        kinds: set[str] = set()
+        captioned = 0
+        for asset_id in self._selection or []:
+            shard = federation.shard_for_asset(fed, asset_id)
+            caps = imgdb.get_captions_for_asset(shard.conn, asset_id)
+            if any((content or "").strip() for content, _v in caps.values()):
+                captioned += 1
+            kinds.update(caps.keys())
+        filtered_count = federation.count_filtered_assets(fed, self._checked, self._rules)
+        total_count = federation.count_filtered_assets(fed, self._checked, [])
+        return tag_lookup, sorted(kinds), captioned, filtered_count, total_count
+
     # -- step 2: present the import dialog, then branch on scope -------------
+
+    def _show_selection_dialog(self, data: tuple) -> None:
+        tag_lookup, kinds, captioned, filtered_count, total_count = data
+        if not captioned:
+            QMessageBox.information(
+                self._parent, "No captions",
+                "None of the selected images have captions to import from.",
+            )
+            return
+        self._tag_lookup = tag_lookup
+        dlg = ImportFromCaptionDialog(
+            caption_texts={},
+            all_caption_kinds=kinds,
+            match_func=lambda text: federation.match_tags_in_text(text, tag_lookup),
+            filtered_count=filtered_count,
+            total_count=total_count,
+            selection_count=len(self._selection or []),
+            parent=self._parent,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._caption_kind = dlg.caption_kind()
+        self._start_bulk(dlg.scope(), dlg.ambiguous_policy())
 
     def _show_dialog(self, data: tuple) -> None:
         tag_lookup, caption_texts, all_kinds, filtered_count, total_count = data
@@ -91,6 +137,9 @@ class CaptionImportFlow:
             self._import_single(dlg.selected_tags())
             return
 
+        self._start_bulk(scope, dlg.ambiguous_policy())
+
+    def _start_bulk(self, scope: str, policy: str) -> None:
         # Bulk scope — kwargs shared by prescan and import.
         self._bulk_kwargs = dict(
             caption_kind=self._caption_kind,
@@ -99,8 +148,10 @@ class CaptionImportFlow:
         )
         if scope == "filtered":
             self._bulk_kwargs["filter_rules"] = self._rules
+        elif scope == "selection":
+            self._bulk_kwargs["asset_ids"] = self._selection
 
-        if dlg.ambiguous_policy() == "ask":
+        if policy == "ask":
             self._bridge.submit(self._prescan, on_result=self._resolve, on_error=self._on_error)
         else:
             self._run_bulk_import({})

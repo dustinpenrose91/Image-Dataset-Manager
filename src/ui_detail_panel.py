@@ -929,6 +929,7 @@ class _MultiDetail(QWidget):
     batch_add_to_dataset_requested = Signal(list)         # list[AssetRow]
     batch_remove_from_dataset_requested = Signal(list)    # list[AssetRow]
     merge_two_requested = Signal(list)                    # list[AssetRow], exactly 2 same shard
+    batch_import_from_caption_requested = Signal(list)    # list[str] asset_ids
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -952,6 +953,12 @@ class _MultiDetail(QWidget):
 
         replace_tag_btn = QPushButton("Replace tag in all…")
         replace_tag_btn.clicked.connect(lambda: self.batch_replace_tag_requested.emit(self._assets))
+
+        import_btn = QPushButton("Import tags from captions…")
+        import_btn.setToolTip("Extract tags from the selected images' caption text")
+        import_btn.clicked.connect(lambda: self.batch_import_from_caption_requested.emit(
+            [a.asset_id for a in self._assets]
+        ))
 
         self._move_btn = QPushButton("Move all…")
         self._move_btn.clicked.connect(lambda: self.batch_move_requested.emit(self._assets))
@@ -984,6 +991,7 @@ class _MultiDetail(QWidget):
         layout.addWidget(tag_btn)
         layout.addWidget(remove_tag_btn)
         layout.addWidget(replace_tag_btn)
+        layout.addWidget(import_btn)
         layout.addWidget(self._move_btn)
         layout.addWidget(dataset_btn)
         layout.addWidget(self._remove_from_dataset_btn)
@@ -1051,6 +1059,7 @@ class DetailPanel(QWidget):
     batch_add_to_dataset_requested = Signal(list)        # list[AssetRow]
     batch_remove_from_dataset_requested = Signal(list)   # list[AssetRow]
     merge_two_requested = Signal(list)
+    batch_import_from_caption_requested = Signal(list)   # list[str] asset_ids
     autocaption_requested = Signal(list, object)        # asset_ids, AutoCaptionRequest
 
     def __init__(
@@ -1104,6 +1113,9 @@ class DetailPanel(QWidget):
         self._multi.batch_add_to_dataset_requested.connect(self.batch_add_to_dataset_requested)
         self._multi.batch_remove_from_dataset_requested.connect(self.batch_remove_from_dataset_requested)
         self._multi.merge_two_requested.connect(self.merge_two_requested)
+        self._multi.batch_import_from_caption_requested.connect(
+            self.batch_import_from_caption_requested
+        )
 
         self._stack = QStackedWidget()
         self._stack.addWidget(self._empty)   # 0

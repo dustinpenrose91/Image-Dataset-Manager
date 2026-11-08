@@ -445,6 +445,35 @@ class FederationWriteTests(unittest.TestCase):
         names = [canon for canon, _types in result]
         self.assertIn("sunset", names)
 
+    def test_bulk_import_caption_tags_limited_to_asset_ids(self):
+        ids = self._alpha_ids()
+        add_tags(self.fed, ids[0], ["beach"], type_name="General")
+        set_caption(self.fed, ids[1], "short", "a sandy beach")
+        set_caption(self.fed, ids[2], "short", "a sandy beach")
+        lookup = federation.build_tag_lookup(self.fed)
+        added = federation.bulk_import_caption_tags(
+            self.fed, "short", lookup, {}, asset_ids=[ids[1]]
+        )
+        self.assertEqual(added, 1)
+        conn = self.fed.shards["alpha"].conn
+        self.assertIn("beach", [t["name"] for t in imgdb.get_tags_for_asset(conn, ids[1])])
+        self.assertNotIn("beach", [t["name"] for t in imgdb.get_tags_for_asset(conn, ids[2])])
+
+    def test_prescan_ambiguous_limited_to_asset_ids(self):
+        captioned = self._seed_ambiguous()
+        other = [i for i in self._alpha_ids() if i != captioned][0]
+        lookup = federation.build_tag_lookup(self.fed)
+        self.assertEqual(
+            federation.prescan_ambiguous_matches(
+                self.fed, "short", lookup, asset_ids=[other]
+            ),
+            [],
+        )
+        names = [c for c, _t in federation.prescan_ambiguous_matches(
+            self.fed, "short", lookup, asset_ids=[captioned]
+        )]
+        self.assertIn("sunset", names)
+
     def test_phash_failed_sentinel_excluded_from_missing(self):
         ids = self._alpha_ids()
         conn = self.fed.shards["alpha"].conn

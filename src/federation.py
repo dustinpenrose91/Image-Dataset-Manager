@@ -1614,18 +1614,19 @@ def prescan_ambiguous_matches(
     tag_lookup: dict[str, tuple[str, list[str]]],
     checked_labels: Optional[list[str]] = None,
     filter_rules: Optional[list[FilterRule]] = None,
+    asset_ids: Optional[list[str]] = None,
 ) -> list[tuple[str, list[str]]]:
     """
     Scan all in-scope captions and return the unique set of ambiguous tag
     matches (those with more than one possible category).  Used before bulk
     "Ask per tag" imports so the user resolves each name exactly once.
+    Scope is as for `bulk_import_caption_tags`.
     """
     seen: dict[str, tuple[str, list[str]]] = {}
-    for asset in list_filtered_assets(fed, checked_labels, filter_rules or [], []):
-        shard = fed.shards.get(asset.root)
-        if shard is None:
-            continue
-        text = _caption_text_for_asset(shard, asset.asset_id, caption_kind)
+    for shard, asset_id in _caption_import_scope(
+        fed, checked_labels, filter_rules, asset_ids
+    ):
+        text = _caption_text_for_asset(shard, asset_id, caption_kind)
         for canon, types in match_tags_in_text(text, tag_lookup):
             if len(types) > 1:
                 key = canon.lower()
@@ -1641,22 +1642,42 @@ def bulk_import_caption_tags(
     resolution: dict[str, str],
     checked_labels: Optional[list[str]] = None,
     filter_rules: Optional[list[FilterRule]] = None,
+    asset_ids: Optional[list[str]] = None,
 ) -> int:
-    """Import matched tags for every asset in scope. Returns total assignments added."""
+    """
+    Import matched tags for every asset in scope. Returns total assignments added.
+
+    Scope: an explicit `asset_ids` list (e.g. the table selection) when given,
+    otherwise every asset in the checked shards matching `filter_rules`.
+    """
     total = 0
-    for asset in list_filtered_assets(
-        fed,
-        checked_labels,
-        filter_rules or [],
-        [],
+    for shard, asset_id in _caption_import_scope(
+        fed, checked_labels, filter_rules, asset_ids
     ):
-        shard = fed.shards.get(asset.root)
-        if shard is None:
-            continue
         total += import_caption_tags_for_asset(
-            fed, asset.asset_id, caption_kind, tag_lookup, resolution, _shard=shard
+            fed, asset_id, caption_kind, tag_lookup, resolution, _shard=shard
         )
     return total
+
+
+def _caption_import_scope(
+    fed: Federation,
+    checked_labels: Optional[list[str]],
+    filter_rules: Optional[list[FilterRule]],
+    asset_ids: Optional[list[str]],
+) -> Iterator[tuple["Shard", str]]:
+    """Yield (shard, asset_id) for a caption-tag import scope.
+
+    An explicit `asset_ids` list wins over checked shards + filter rules; each
+    id is routed via the asset index (unknown or unavailable ids raise)."""
+    if asset_ids is not None:
+        for asset_id in asset_ids:
+            yield shard_for_asset(fed, asset_id), asset_id
+        return
+    for asset in list_filtered_assets(fed, checked_labels, filter_rules or [], []):
+        shard = fed.shards.get(asset.root)
+        if shard is not None:
+            yield shard, asset.asset_id
 
 
 def list_datasets_federation(fed: Federation) -> list[DatasetInfo]:
