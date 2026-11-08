@@ -1403,6 +1403,7 @@ class MainWindow(QMainWindow):
         s.setValue("tag_panel/header", self._tag_panel.save_header_state())
         s.setValue("worker/backfill_phash", self._backfill_cb.isChecked())
         s.setValue("worker/batch_size", self._batch_size_spin.value())
+        s.setValue("detail/caption_height", self._detail_panel.caption_height())
 
     def _restore_settings(self) -> None:
         s = self._settings()
@@ -1418,6 +1419,9 @@ class MainWindow(QMainWindow):
         self._backfill_cb.setChecked(backfill)
         batch = s.value("worker/batch_size", defaultValue=50, type=int)
         self._batch_size_spin.setValue(batch)
+        cap_h = s.value("detail/caption_height", defaultValue=0, type=int)
+        if cap_h:
+            self._detail_panel.set_caption_height(cap_h)
         self._load_captioning()
 
     def closeEvent(self, event) -> None:
