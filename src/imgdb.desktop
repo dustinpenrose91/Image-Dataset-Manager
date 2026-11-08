@@ -1,7 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Image Dataset Manager
-Exec=python3 /home/dustin/Documents/Image Dataset Manager/src/imgdb_ui.py
+Exec=python3 "/home/dustin/Documents/Image Dataset Manager/src/imgdb_ui.py"
+Path=/home/dustin/Documents/Image Dataset Manager
 Icon=/home/dustin/Documents/Image Dataset Manager/src/icons/imgdb_256.png
 StartupWMClass=imgdb
 Categories=Graphics;Science;

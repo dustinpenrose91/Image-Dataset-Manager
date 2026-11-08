@@ -1386,6 +1386,11 @@ class ImportFromCaptionDialog(QDialog):
     """
     Configure and preview a caption-to-tag import for one image or in bulk.
 
+    selection_count: when given, the dialog is opened from a multi-image
+                     selection — the first scope becomes "Selected images (N)",
+                     there is no per-image preview, and `caption_texts` is
+                     ignored (pass {}).
+
     match_func: callable(text: str) -> list[(canonical_name, [type_names])]
                 Built by the caller as a closure over the pre-built tag lookup,
                 so the dialog needs no federation dependency.
@@ -1402,14 +1407,18 @@ class ImportFromCaptionDialog(QDialog):
         match_func: Callable[[str], list[tuple[str, list[str]]]],
         filtered_count: int,
         total_count: int,
+        selection_count: Optional[int] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Import Tags from Caption")
-        self.setMinimumWidth(440)
+        self._multi = selection_count is not None
+        self.setWindowTitle(
+            "Import Tags from Captions" if self._multi else "Import Tags from Caption"
+        )
+        self.setMinimumWidth(360 if self._multi else 440)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
 
-        self._caption_texts = caption_texts
+        self._caption_texts = {} if self._multi else caption_texts
         self._match_func = match_func
         self._current_matches: list[tuple[str, list[str]]] = []
 
@@ -1427,7 +1436,10 @@ class ImportFromCaptionDialog(QDialog):
         form.addRow("Caption:", self._kind_combo)
 
         # ── Scope ─────────────────────────────────────────────────────────
-        self._single_radio   = QRadioButton("This image only")
+        self._single_radio   = QRadioButton(
+            f"Selected images  ({selection_count:,})" if self._multi
+            else "This image only"
+        )
         self._filtered_radio = QRadioButton(f"Filtered images  ({filtered_count:,})")
         self._all_radio      = QRadioButton(f"All images in checked shards  ({total_count:,})")
         self._single_radio.setChecked(True)
@@ -1510,12 +1522,16 @@ class ImportFromCaptionDialog(QDialog):
         layout.addLayout(btn_row)
 
         self._on_kind_changed()
+        if self._multi:
+            self._on_scope_changed()   # no per-image preview for a selection
+            self.adjustSize()
 
     # -- public accessors ----------------------------------------------------
 
     def scope(self) -> str:
+        """"single" | "selection" | "filtered" | "all"."""
         if self._single_radio.isChecked():
-            return "single"
+            return "selection" if self._multi else "single"
         if self._filtered_radio.isChecked():
             return "filtered"
         return "all"
@@ -1559,7 +1575,7 @@ class ImportFromCaptionDialog(QDialog):
         self._rebuild_preview()
 
     def _on_scope_changed(self) -> None:
-        is_single = self._single_radio.isChecked()
+        is_single = self._single_radio.isChecked() and not self._multi
         self._preview_header.setVisible(is_single)
         self._preview_table.setVisible(is_single)
         self._no_match_label.setVisible(is_single and not self._current_matches)
@@ -1572,7 +1588,7 @@ class ImportFromCaptionDialog(QDialog):
         self._preview_table.setRowCount(0)
         has_matches = bool(self._current_matches)
         self._no_match_label.setVisible(
-            self._single_radio.isChecked() and not has_matches
+            self._single_radio.isChecked() and not self._multi and not has_matches
         )
 
         for canon, types in self._current_matches:

@@ -5,6 +5,9 @@ currently selected asset, plus batch-action UI when multiple assets are selected
 Single-asset state:  full thumbnail + metadata + tag chips + caption editors
 Multi-asset state:   asset count + batch [Add tag…] / [Delete…] buttons
 Empty state:         placeholder text
+
+One AutoCaptionPanel is shared by the single and multi views: load_selection
+reparents it into whichever view is shown, so its settings never diverge.
 """
 from __future__ import annotations
 
@@ -12,12 +15,12 @@ import os
 from typing import Optional
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QCompleter, QDialog, QFrame, QHBoxLayout, QLabel,
-    QLayout, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
-    QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
-    QVBoxLayout, QWidget,
+    QLayout, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 import federation
@@ -25,6 +28,7 @@ import imgdb
 import imgdb_thumbs
 from imgdb_thumbs_qt import QtThumbnailBridge
 from imgdb_worker_qt import QtDBBridge
+from ui_autocaption import AutoCaptionPanel
 from ui_dialogs import (
     AddCaptionDialog, AddTagCategoryDialog, AddToDatasetDialog, BatchMoveDialog,
     BatchRemoveTagDialog, BatchReplaceTagDialog, BatchTagDialog,
@@ -33,6 +37,9 @@ from ui_dialogs import (
 
 THUMB_DISPLAY_SIZE = 256
 PANEL_WIDTH = 270
+CAPTION_HEIGHT_DEFAULT = 72
+CAPTION_HEIGHT_MIN = 40
+CAPTION_HEIGHT_MAX = 1200
 
 
 # ---------------------------------------------------------------------------
@@ -303,15 +310,64 @@ class _TagsSection(QWidget):
 # Caption editor block
 # ---------------------------------------------------------------------------
 
+class _ResizeGrip(QWidget):
+    """Thin horizontal handle under a widget; dragging it vertically emits the
+    requested new height. Double-click emits the default height."""
+
+    height_requested = Signal(int)
+
+    def __init__(self, target: QWidget, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._target = target
+        self._drag_origin: Optional[tuple[float, int]] = None  # (global y, start height)
+        self.setFixedHeight(8)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setToolTip("Drag to resize · double-click to reset")
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = (event.globalPosition().y(), self._target.height())
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_origin is not None:
+            y0, h0 = self._drag_origin
+            h = int(h0 + event.globalPosition().y() - y0)
+            self.height_requested.emit(
+                max(CAPTION_HEIGHT_MIN, min(CAPTION_HEIGHT_MAX, h))
+            )
+            event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_origin = None
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self.height_requested.emit(CAPTION_HEIGHT_DEFAULT)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setPen(self.palette().mid().color())
+        cx, cy = self.width() // 2, self.height() // 2
+        for dy in (-1, 1):
+            p.drawLine(cx - 12, cy + dy, cx + 12, cy + dy)
+
+
 class _CaptionBlock(QWidget):
-    """One kind + its always-editable QPlainTextEdit that saves on focus-out."""
+    """One kind + its always-editable QPlainTextEdit that saves on focus-out.
+    The grip under the editor resizes it; the owner applies the height to every
+    block so all caption editors stay the same size. The header's arrow button
+    collapses the editor; delete is a separate, labelled button on the right so
+    it can't be mistaken for collapse."""
 
     save_requested = Signal(str, str)       # kind, content
     delete_requested = Signal(str)          # kind
     validated_changed = Signal(str, bool)   # kind, validated
+    height_requested = Signal(int)          # editor height in px
+    collapsed_changed = Signal(str, bool)   # kind, collapsed
 
     def __init__(
         self, kind: str, content: str, is_validated: bool = False,
+        editor_height: int = CAPTION_HEIGHT_DEFAULT, collapsed: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -319,24 +375,31 @@ class _CaptionBlock(QWidget):
         self._original = content
 
         kind_row = QHBoxLayout()
-        kind_label = QLabel(f"<b>{kind}</b>")
+        self._toggle = QToolButton()
+        self._toggle.setText(kind)
+        self._toggle.setStyleSheet("font-weight: bold;")
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setAutoRaise(True)
+        self._toggle.setCheckable(True)
+        self._toggle.setToolTip("Collapse / expand this caption")
+        self._toggle.toggled.connect(self._on_toggled)
         validated_cb = QCheckBox("Validated")
         validated_cb.setStyleSheet("font-size: 11px; color: #555;")
         validated_cb.setChecked(is_validated)
         validated_cb.toggled.connect(lambda v: self.validated_changed.emit(kind, v))
         self._validated_cb = validated_cb
-        del_btn = QPushButton("−")
-        del_btn.setFixedWidth(22)
-        del_btn.setStyleSheet("color: #c0392b; font-weight: bold;")
-        del_btn.setToolTip(f"Delete '{kind}' caption")
+        del_btn = QPushButton("Delete")
+        del_btn.setFlat(True)
+        del_btn.setStyleSheet("color: #c0392b; font-size: 11px;")
+        del_btn.setToolTip(f"Delete the '{kind}' caption from this image")
         del_btn.clicked.connect(lambda: self.delete_requested.emit(kind))
-        kind_row.addWidget(kind_label)
+        kind_row.addWidget(self._toggle)
         kind_row.addWidget(validated_cb)
         kind_row.addStretch()
         kind_row.addWidget(del_btn)
 
         self._editor = QPlainTextEdit(content)
-        self._editor.setFixedHeight(72)
+        self._editor.setFixedHeight(editor_height)
         self._editor.setPlaceholderText("(empty)")
         self._editor.focusOutEvent = self._on_focus_out  # type: ignore[assignment]
 
@@ -345,10 +408,42 @@ class _CaptionBlock(QWidget):
         layout.setSpacing(2)
         layout.addLayout(kind_row)
         layout.addWidget(self._editor)
+        self._grip = _ResizeGrip(self._editor)
+        self._grip.height_requested.connect(self.height_requested)
+        layout.addWidget(self._grip)
+
+        self._toggle.blockSignals(True)
+        self._toggle.setChecked(collapsed)
+        self._toggle.blockSignals(False)
+        self._apply_collapsed(collapsed)
+
+    def content(self) -> str:
+        return self._editor.toPlainText()
+
+    def _on_toggled(self, collapsed: bool) -> None:
+        self._apply_collapsed(collapsed)
+        self.collapsed_changed.emit(self._kind, collapsed)
+        if not collapsed:
+            self._editor.setFocus()
+
+    def _apply_collapsed(self, collapsed: bool) -> None:
+        # Hiding a focused editor fires focusOut, so pending edits still save.
+        self._toggle.setArrowType(
+            Qt.ArrowType.RightArrow if collapsed else Qt.ArrowType.DownArrow
+        )
+        self._editor.setVisible(not collapsed)
+        self._grip.setVisible(not collapsed)
+
+    def set_editor_height(self, height: int) -> None:
+        self._editor.setFixedHeight(height)
 
     def set_content(self, content: str) -> None:
         self._original = content
         self._editor.setPlainText(content)
+
+    def is_dirty(self) -> bool:
+        """True while the editor holds unsaved user edits."""
+        return self._editor.toPlainText() != self._original
 
     def set_state(self, content: str, is_validated: bool) -> None:
         """Reuse this block for another asset's caption of the same kind, without
@@ -400,6 +495,10 @@ class _SingleDetail(QWidget):
         self._asset: Optional[federation.AssetRow] = None
         self._root_abs: Optional[str] = None
         self._caption_blocks: dict[str, _CaptionBlock] = {}
+        self._caption_height = CAPTION_HEIGHT_DEFAULT
+        # Caption kinds the user collapsed; kept for the session so the choice
+        # follows them across assets (not persisted: kind names are shard data).
+        self._collapsed_kinds: set[str] = set()
         self._active_dataset: Optional[str] = None
         self._is_favorite = False
 
@@ -503,6 +602,10 @@ class _SingleDetail(QWidget):
         cl.addWidget(captions_header)
         cl.addLayout(self._captions_container)
         cl.addWidget(add_caption_btn)
+        # DetailPanel parks the shared AutoCaptionPanel here when single-select.
+        self.autocaption_slot = QVBoxLayout()
+        self.autocaption_slot.setContentsMargins(0, 0, 0, 0)
+        cl.addLayout(self.autocaption_slot)
         cl.addWidget(sep3)
         cl.addLayout(actions_row)
         cl.addWidget(merge_btn)
@@ -580,8 +683,21 @@ class _SingleDetail(QWidget):
         if self._asset and self._asset.asset_id == asset_id:
             self._thumb_label.set_source_pixmap(pixmap)
 
-    def _load_tags_and_captions(self, asset: federation.AssetRow) -> None:
-        """Full bundle reload — used on selection change (one worker round-trip)."""
+    def refresh_captions(self, asset_id: str) -> None:
+        """Re-fetch after an external caption write (auto-caption) if this asset
+        is showing. Blocks the user is mid-edit in keep their text."""
+        if self._asset is not None and self._asset.asset_id == asset_id:
+            self._load_tags_and_captions(self._asset, keep_dirty=True)
+
+    def _load_tags_and_captions(
+        self, asset: federation.AssetRow, keep_dirty: bool = False,
+    ) -> None:
+        """Full bundle reload — used on selection change (one worker round-trip).
+
+        keep_dirty: leave caption editors with unsaved edits untouched. Only
+        for refreshes of the same asset — on asset switch a reused block must
+        always take the new asset's content.
+        """
         aid = asset.asset_id
         root = asset.root
 
@@ -603,7 +719,7 @@ class _SingleDetail(QWidget):
             tag_rows, caps, all_types, datasets, tags_validated, is_favorite = data
             self._rebuild_tags(tag_rows, all_types)
             self._tags_validated_cb.setChecked(tags_validated)
-            self._rebuild_captions(caps)
+            self._rebuild_captions(caps, keep_dirty)
             self._load_datasets(datasets)
             self._apply_favorite_state(is_favorite)
 
@@ -659,7 +775,9 @@ class _SingleDetail(QWidget):
     def _rebuild_tags(self, tag_rows: list, all_types: list[str]) -> None:
         self._tags_section.load_tags(tag_rows, all_types)
 
-    def _rebuild_captions(self, caps: dict[str, tuple[str, bool]]) -> None:
+    def _rebuild_captions(
+        self, caps: dict[str, tuple[str, bool]], keep_dirty: bool = False,
+    ) -> None:
         # Diff by kind: reuse an existing block for the same kind (update content
         # + validated in place), add blocks for new kinds, drop blocks for gone
         # kinds. Avoids tearing down every editor when the kind set is unchanged.
@@ -671,7 +789,12 @@ class _SingleDetail(QWidget):
         for kind, (content, is_validated) in caps.items():
             block = self._caption_blocks.get(kind)
             if block is None:
-                block = _CaptionBlock(kind, content, is_validated)
+                block = _CaptionBlock(
+                    kind, content, is_validated, self._caption_height,
+                    collapsed=kind in self._collapsed_kinds,
+                )
+                block.height_requested.connect(self.set_caption_height)
+                block.collapsed_changed.connect(self._on_caption_collapsed)
                 block.save_requested.connect(
                     lambda k, c: self.caption_saved.emit(self._asset.asset_id if self._asset else "", k, c)
                 )
@@ -679,8 +802,24 @@ class _SingleDetail(QWidget):
                 block.validated_changed.connect(self._on_caption_validated_toggled)
                 self._captions_container.addWidget(block)
                 self._caption_blocks[kind] = block
-            else:
+            elif not (keep_dirty and block.is_dirty()):
                 block.set_state(content, is_validated)
+
+    def caption_height(self) -> int:
+        return self._caption_height
+
+    def _on_caption_collapsed(self, kind: str, collapsed: bool) -> None:
+        if collapsed:
+            self._collapsed_kinds.add(kind)
+        else:
+            self._collapsed_kinds.discard(kind)
+
+    def set_caption_height(self, height: int) -> None:
+        """Apply one editor height to every caption block (and future ones)."""
+        height = max(CAPTION_HEIGHT_MIN, min(CAPTION_HEIGHT_MAX, height))
+        self._caption_height = height
+        for block in self._caption_blocks.values():
+            block.set_editor_height(height)
 
     def _add_tag(self, name: str, type_name: str) -> None:
         if self._asset:
@@ -701,9 +840,21 @@ class _SingleDetail(QWidget):
             self.caption_validated_changed.emit(self._asset.asset_id, kind, checked)
 
     def _delete_caption(self, kind: str) -> None:
-        if self._asset:
-            self.caption_deleted.emit(self._asset.asset_id, kind)
-            self._load_tags_and_captions(self._asset)
+        if not self._asset:
+            return
+        block = self._caption_blocks.get(kind)
+        if block is not None and block.content().strip():
+            answer = QMessageBox.question(
+                self, "Delete caption",
+                f"Delete the '{kind}' caption from this image?\n\n"
+                "This cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.caption_deleted.emit(self._asset.asset_id, kind)
+        self._load_tags_and_captions(self._asset)
 
     def _add_caption(self) -> None:
         if not self._asset:
@@ -778,6 +929,7 @@ class _MultiDetail(QWidget):
     batch_add_to_dataset_requested = Signal(list)         # list[AssetRow]
     batch_remove_from_dataset_requested = Signal(list)    # list[AssetRow]
     merge_two_requested = Signal(list)                    # list[AssetRow], exactly 2 same shard
+    batch_import_from_caption_requested = Signal(list)    # list[str] asset_ids
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -801,6 +953,12 @@ class _MultiDetail(QWidget):
 
         replace_tag_btn = QPushButton("Replace tag in all…")
         replace_tag_btn.clicked.connect(lambda: self.batch_replace_tag_requested.emit(self._assets))
+
+        import_btn = QPushButton("Import tags from captions…")
+        import_btn.setToolTip("Extract tags from the selected images' caption text")
+        import_btn.clicked.connect(lambda: self.batch_import_from_caption_requested.emit(
+            [a.asset_id for a in self._assets]
+        ))
 
         self._move_btn = QPushButton("Move all…")
         self._move_btn.clicked.connect(lambda: self.batch_move_requested.emit(self._assets))
@@ -833,11 +991,17 @@ class _MultiDetail(QWidget):
         layout.addWidget(tag_btn)
         layout.addWidget(remove_tag_btn)
         layout.addWidget(replace_tag_btn)
+        layout.addWidget(import_btn)
         layout.addWidget(self._move_btn)
         layout.addWidget(dataset_btn)
         layout.addWidget(self._remove_from_dataset_btn)
         layout.addWidget(delete_btn)
         layout.addWidget(self._merge_btn)
+        layout.addWidget(_sep())
+        # DetailPanel parks the shared AutoCaptionPanel here when multi-select.
+        self.autocaption_slot = QVBoxLayout()
+        self.autocaption_slot.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self.autocaption_slot)
         layout.addStretch()
 
     def load_assets(self, assets: list[federation.AssetRow]) -> None:
@@ -895,6 +1059,8 @@ class DetailPanel(QWidget):
     batch_add_to_dataset_requested = Signal(list)        # list[AssetRow]
     batch_remove_from_dataset_requested = Signal(list)   # list[AssetRow]
     merge_two_requested = Signal(list)
+    batch_import_from_caption_requested = Signal(list)   # list[str] asset_ids
+    autocaption_requested = Signal(list, object)        # asset_ids, AutoCaptionRequest
 
     def __init__(
         self,
@@ -904,7 +1070,16 @@ class DetailPanel(QWidget):
     ) -> None:
         super().__init__(parent)
         self._bridge = bridge
+        self._selected_ids: list[str] = []
+        self._autocaption_host: Optional[QWidget] = None
         self.setMinimumWidth(180)
+
+        # Shared between the single and multi views; MainWindow wires its
+        # other signals (cancel/unload/manage prompts/settings) directly.
+        self.autocaption = AutoCaptionPanel()
+        self.autocaption.generate_requested.connect(
+            lambda req: self.autocaption_requested.emit(list(self._selected_ids), req)
+        )
 
         self._empty = QLabel("Select an asset\nto see details.")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -938,6 +1113,9 @@ class DetailPanel(QWidget):
         self._multi.batch_add_to_dataset_requested.connect(self.batch_add_to_dataset_requested)
         self._multi.batch_remove_from_dataset_requested.connect(self.batch_remove_from_dataset_requested)
         self._multi.merge_two_requested.connect(self.merge_two_requested)
+        self._multi.batch_import_from_caption_requested.connect(
+            self.batch_import_from_caption_requested
+        )
 
         self._stack = QStackedWidget()
         self._stack.addWidget(self._empty)   # 0
@@ -960,9 +1138,15 @@ class DetailPanel(QWidget):
         assets: list[federation.AssetRow],
         fed: Optional[federation.Federation],
     ) -> None:
+        self._selected_ids = [a.asset_id for a in assets]
+        self.autocaption.set_target_count(len(assets))
         if not assets:
             self._stack.setCurrentIndex(0)
             return
+        view = self._single if len(assets) == 1 else self._multi
+        if self._autocaption_host is not view:
+            view.autocaption_slot.addWidget(self.autocaption)  # reparents
+            self._autocaption_host = view
         if len(assets) == 1:
             asset = assets[0]
             root_abs = fed.shards[asset.root].abs_path if (
@@ -973,6 +1157,15 @@ class DetailPanel(QWidget):
         else:
             self._multi.load_assets(assets)
             self._stack.setCurrentIndex(2)
+
+    def refresh_captions(self, asset_id: str) -> None:
+        self._single.refresh_captions(asset_id)
+
+    def caption_height(self) -> int:
+        return self._single.caption_height()
+
+    def set_caption_height(self, height: int) -> None:
+        self._single.set_caption_height(height)
 
 
 # ---------------------------------------------------------------------------

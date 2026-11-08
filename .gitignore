@@ -2,3 +2,5 @@ src/__pycache__/
 imgdb.conf
 imgdb_ui.ini
 .claude/
+caption_test/
+captioning/
