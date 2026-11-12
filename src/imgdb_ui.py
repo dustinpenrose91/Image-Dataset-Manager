@@ -1385,10 +1385,12 @@ class MainWindow(QMainWindow):
         verb = "cancelled" if cancelled else "complete"
         self._status_bar.showMessage(f"Auto-caption {verb}: " + ", ".join(parts), 10000)
         if written:
-            # caption_count filters / new kinds may have changed; refresh once
-            # per run (not per image) without losing the user's place.
+            # A new caption kind may now exist. The table is deliberately not
+            # refreshed: a caption write never adds, removes or reorders rows
+            # under the default view, and a model reset would clear the
+            # selection and bounce the scroll position. Manual caption edits
+            # don't refresh it either.
             self._refresh_caption_kinds()
-            self._on_assets_changed(True)
 
     # -----------------------------------------------------------------------
     # Shutdown

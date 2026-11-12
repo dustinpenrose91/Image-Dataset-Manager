@@ -209,6 +209,10 @@ class AutoCaptionPanel(QWidget):
         self._model_combo.addItems(list(self._models))
         if current in self._models:
             self._model_combo.setCurrentText(current)
+        elif self._models:
+            # With a placeholder set, QComboBox leaves the index at -1 when
+            # items are added, so select the first model explicitly.
+            self._model_combo.setCurrentIndex(0)
         self._model_combo.blockSignals(False)
         if self._model_combo.currentText() != current:
             # Selection changed implicitly (e.g. first population): apply the
